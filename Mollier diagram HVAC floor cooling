@@ -1,0 +1,1309 @@
+# mollier_app.py
+# Mollier diagram + binnen/buiten klimaat + gevoelstemperatuur
+# + vloerkoeling regeling (manueel of via Arduino)
+# Alleen Python — Arduino sketch staat onderaan als string.
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import math
+import threading
+import time
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+
+# ============================================================
+# ARDUINO SKETCH (als string, zodat we het kunnen opslaan)
+# ============================================================
+ARDUINO_SKETCH = r'''// vloerkoeling.ino
+// Arduino vloerkoeling regeling
+// Ontvangt via Serial:  C,<0|1>,<aanvoertemp>\n
+//                       S\n  (status opvragen)
+// Stuurt terug:         ACK\n  of  STATUS,<aan>,<temp>\n
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS 2
+#define RELAIS_PIN   8
+#define LED_PIN      13
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+bool  koelingAan  = false;
+float aanvoerTemp = 0.0;
+
+void setup() {
+  Serial.begin(9600);
+  sensors.begin();
+  pinMode(RELAIS_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(RELAIS_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("READY");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("C,")) {
+      int eerste = line.indexOf(',');
+      int tweede = line.indexOf(',', eerste + 1);
+      int aan    = line.substring(eerste + 1, tweede).toInt();
+      float temp = line.substring(tweede + 1).toFloat();
+
+      if (aan == 1) {
+        koelingAan  = true;
+        aanvoerTemp = temp;
+        digitalWrite(RELAIS_PIN, HIGH);
+        digitalWrite(LED_PIN, HIGH);
+      } else {
+        koelingAan = false;
+        digitalWrite(RELAIS_PIN, LOW);
+        digitalWrite(LED_PIN, LOW);
+      }
+      Serial.println("ACK");
+    }
+    else if (line == "S") {
+      Serial.print("STATUS,");
+      Serial.print(koelingAan ? 1 : 0);
+      Serial.print(",");
+      Serial.println(aanvoerTemp, 1);
+    }
+  }
+
+  static unsigned long laatste = 0;
+  if (millis() - laatste > 5000) {
+    laatste = millis();
+    sensors.requestTemperatures();
+    float t = sensors.getTempCByIndex(0);
+    if (t > -100) {
+      Serial.print("T,");
+      Serial.println(t, 1);
+    }
+  }
+}
+'''
+
+
+# ============================================================
+# PSYCHROMETRIE
+# ============================================================
+class Psychrometrie:
+    """Psychrometrische berekeningen met condensatie en gevoelstemperatuur."""
+
+    def __init__(self, p_atm=101325):
+        self.p_atm = p_atm
+        self.c_pa = 1.006
+        self.h_we = 2501
+        self.c_pv = 1.86
+        self.R_lucht = 287.05
+
+    def p_sat(self, T):
+        return 610.78 * math.exp(17.27 * T / (T + 237.3))
+
+    def x_uit_pv(self, p_v):
+        return 0.62198 * p_v / (self.p_atm - p_v)
+
+    def enthalpie(self, T, x):
+        return self.c_pa * T + x * (self.h_we + self.c_pv * T)
+
+    def dauwpunt(self, p_v):
+        if p_v <= 0:
+            return None
+        try:
+            return (237.3 * math.log(p_v / 610.78)) / (17.27 - math.log(p_v / 610.78))
+        except Exception:
+            return None
+
+    def dauwpunt_uit_T_phi(self, T, phi):
+        p_v = (phi / 100.0) * self.p_sat(T)
+        return self.dauwpunt(p_v)
+
+    def natte_bol_temperatuur(self, T, phi):
+        p_v = (phi / 100.0) * self.p_sat(T)
+        x = self.x_uit_pv(p_v)
+        h = self.enthalpie(T, x)
+        Twb = T - 5
+        for _ in range(50):
+            p_sat_wb = self.p_sat(Twb)
+            x_wb = self.x_uit_pv(p_sat_wb)
+            h_wb = self.enthalpie(Twb, x_wb)
+            delta_h = h - h_wb
+            if abs(delta_h) < 0.001:
+                break
+            Twb = Twb + delta_h / 4.0
+            if Twb < -10:
+                Twb = -10
+                break
+        return Twb
+
+    def dichtheid(self, T, x):
+        T_K = T + 273.15
+        p_v = x * self.p_atm / (0.62198 + x)
+        p_droog = self.p_atm - p_v
+        return (p_droog / (self.R_lucht * T_K)) * (1 + x)
+
+    # ---------------- GEVOELSTEMPERATUUR ----------------
+
+    def heat_index(self, T, phi):
+        T_F = T * 9 / 5 + 32
+        if T_F < 80:
+            return T
+        HI_F = (-42.379
+                + 2.04901523 * T_F
+                + 10.14333127 * phi
+                - 0.22475541 * T_F * phi
+                - 0.00683783 * T_F ** 2
+                - 0.05481717 * phi ** 2
+                + 0.00122874 * T_F ** 2 * phi
+                + 0.00085282 * T_F * phi ** 2
+                - 0.00000199 * T_F ** 2 * phi ** 2)
+        if phi < 13 and 80 <= T_F <= 112:
+            HI_F -= ((13 - phi) / 4) * math.sqrt((17 - abs(T_F - 95)) / 17)
+        if phi > 85 and 80 <= T_F <= 87:
+            HI_F += ((phi - 85) / 10) * ((87 - T_F) / 5)
+        return (HI_F - 32) * 5 / 9
+
+    def wind_chill(self, T, wind_speed_kmh):
+        if T > 10 or wind_speed_kmh < 4.8:
+            return T
+        return (13.12 + 0.6215 * T
+                - 11.37 * (wind_speed_kmh ** 0.16)
+                + 0.3965 * T * (wind_speed_kmh ** 0.16))
+
+    def humidex(self, T, T_dauw):
+        if T_dauw is None:
+            return T
+        e = 6.11 * math.exp(5417.7530 * (1 / 273.16 - 1 / (T_dauw + 273.15)))
+        return T + 0.5555 * (e - 10)
+
+    def apparent_temperature(self, T, phi, wind_speed_ms=0, solar_radiation=0):
+        e = (phi / 100.0) * 6.105 * math.exp(17.27 * T / (237.7 + T))
+        AT = T + 0.33 * e - 0.70 * wind_speed_ms - 4.00
+        if solar_radiation > 0:
+            AT += 0.0042 * solar_radiation
+        return AT
+
+    def gevoelstemperatuur_binnen(self, T, phi):
+        T_dauw = self.dauwpunt_uit_T_phi(T, phi)
+        hx = self.humidex(T, T_dauw)
+        at = self.apparent_temperature(T, phi, 0, 0)
+        if T >= 20:
+            gevoel = 0.5 * hx + 0.5 * at
+            methode = "Humidex + Apparent Temp (binnen)"
+        else:
+            gevoel = T
+            methode = "Geen (comfortabel)"
+        return {'gevoel': gevoel, 'humidex': hx, 'apparent': at,
+                'T_dauw': T_dauw, 'methode': methode}
+
+    def gevoelstemperatuur_buiten(self, T, phi, wind_speed_kmh=5, solar_radiation=0):
+        wind_speed_ms = wind_speed_kmh / 3.6
+        T_dauw = self.dauwpunt_uit_T_phi(T, phi)
+        if T >= 27:
+            hi = self.heat_index(T, phi)
+            at = self.apparent_temperature(T, phi, wind_speed_ms, solar_radiation)
+            gevoel = 0.4 * hi + 0.6 * at
+            methode = "Heat Index + Apparent Temp (warm)"
+        elif T <= 10 and wind_speed_kmh > 4.8:
+            wc = self.wind_chill(T, wind_speed_kmh)
+            at = self.apparent_temperature(T, phi, wind_speed_ms, solar_radiation)
+            gevoel = 0.6 * wc + 0.4 * at
+            methode = "Wind Chill + Apparent Temp (koud)"
+        else:
+            at = self.apparent_temperature(T, phi, wind_speed_ms, solar_radiation)
+            gevoel = at
+            methode = "Apparent Temperature"
+        return {
+            'gevoel': gevoel,
+            'heat_index': self.heat_index(T, phi),
+            'wind_chill': self.wind_chill(T, wind_speed_kmh),
+            'apparent': self.apparent_temperature(T, phi, wind_speed_ms, solar_radiation),
+            'humidex': self.humidex(T, T_dauw),
+            'T_dauw': T_dauw,
+            'wind_speed': wind_speed_kmh,
+            'solar_radiation': solar_radiation,
+            'methode': methode
+        }
+
+    def condensatie_hoeveelheid(self, V_dot, T_in, phi_in, T_oppervlak):
+        T_dauw = self.dauwpunt_uit_T_phi(T_in, phi_in)
+        if T_dauw is None or T_oppervlak >= T_dauw:
+            return 0, T_dauw, False
+        p_v_in = (phi_in / 100.0) * self.p_sat(T_in)
+        x_in = self.x_uit_pv(p_v_in)
+        rho_in = self.dichtheid(T_in, x_in)
+        m_dot_lucht = rho_in * V_dot
+        p_v_opp = self.p_sat(T_oppervlak)
+        x_opp = self.x_uit_pv(p_v_opp)
+        m_dot_condens = m_dot_lucht * (x_in - x_opp)
+        if m_dot_condens < 0:
+            m_dot_condens = 0
+        return m_dot_condens, T_dauw, True
+
+    def alle_grootheden(self, T, phi, V_dot=300, wind_speed=5, solar=0):
+        p_v = (phi / 100.0) * self.p_sat(T)
+        x = self.x_uit_pv(p_v)
+        h = self.enthalpie(T, x)
+        T_d = self.dauwpunt(p_v)
+        T_wb = self.natte_bol_temperatuur(T, phi)
+        rho = self.dichtheid(T, x)
+        m_dot_lucht = rho * V_dot
+        m_dot_water = m_dot_lucht * x
+        gevoel_binnen = self.gevoelstemperatuur_binnen(T, phi)
+        gevoel_buiten = self.gevoelstemperatuur_buiten(T, phi, wind_speed, solar)
+        return {
+            'T': T, 'phi': phi, 'p_v': p_v, 'x': x, 'h': h,
+            'T_dauw': T_d, 'T_wb': T_wb, 'rho': rho,
+            'V_dot': V_dot, 'm_dot_lucht': m_dot_lucht, 'm_dot_water': m_dot_water,
+            'gevoel_binnen': gevoel_binnen, 'gevoel_buiten': gevoel_buiten
+        }
+
+
+# ============================================================
+# DHT22 / ARDUINO SERIAL READER
+# ============================================================
+class DHT22Reader:
+    """Leest DHT22 via seriële poort. Kan ook commando's sturen naar Arduino."""
+
+    def __init__(self):
+        self.serial_conn = None
+        self.running = False
+        self.thread = None
+        self.callback = None
+
+    @staticmethod
+    def list_ports():
+        if not SERIAL_AVAILABLE:
+            return []
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    def connect(self, port, baudrate=9600):
+        if not SERIAL_AVAILABLE:
+            raise Exception("pyserial niet geïnstalleerd")
+        self.serial_conn = serial.Serial(port, baudrate, timeout=1)
+        time.sleep(2)
+        return True
+
+    def disconnect(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+        self.serial_conn = None
+
+    def start_reading(self, callback):
+        if not self.serial_conn:
+            raise Exception("Geen seriële verbinding")
+        self.callback = callback
+        self.running = True
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+
+    def _read_loop(self):
+        while self.running:
+            try:
+                if self.serial_conn.in_waiting > 0:
+                    line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        parts = line.replace(';', ',').split(',')
+                        if len(parts) >= 2:
+                            try:
+                                T = float(parts[0])
+                                phi = float(parts[1])
+                                if self.callback:
+                                    self.callback(T, phi)
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    def send_command(self, cmd):
+        """Stuur een commando-regel naar de Arduino."""
+        if not self.serial_conn or not self.serial_conn.is_open:
+            return False
+        try:
+            if not cmd.endswith('\n'):
+                cmd += '\n'
+            self.serial_conn.write(cmd.encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Send error: {e}")
+            return False
+
+
+# ============================================================
+# VLOERKOELING CONTROLLER
+# ============================================================
+class VloerkoelingController:
+    """
+    Regelt vloerkoeling op basis van delta T en dauwpunt-beveiliging.
+
+    - Als T_binnen - T_buiten < 2.0 °C  -> vloerkoeling AAN
+    - Aanvoertemperatuur = dauwpunt_binnen + marge - 2.0 °C, min 5 °C
+    """
+
+    def __init__(self, psych):
+        self.psych = psych
+        self.aan = False
+        self.veiligheidsmarge = 1.5
+        self.delta_t_drempel = 2.0
+        self.aanvoer_temp = None
+        self.reden = ""
+
+    def bereken(self, T_binnen, phi_binnen, T_buiten, phi_buiten):
+        T_dauw_binnen = self.psych.dauwpunt_uit_T_phi(T_binnen, phi_binnen)
+        if T_dauw_binnen is None:
+            return {'aan': False, 'aanvoer_temp': None,
+                    'dauwpunt_binnen': None, 'delta_t': None,
+                    'reden': 'Dauwpunt kon niet berekend worden',
+                    'waarschuwing': None}
+
+        delta_t = T_binnen - T_buiten
+        T_vloer_min = T_dauw_binnen + self.veiligheidsmarge
+        T_aanvoer = T_vloer_min - 2.0
+
+        waarschuwing = None
+        if T_aanvoer < 5.0:
+            T_aanvoer = 5.0
+            waarschuwing = ("Aanvoertemperatuur begrensd op 5 °C "
+                            "(vorstbeveiliging / COP-bescherming)")
+
+        if delta_t < self.delta_t_drempel:
+            self.aan = True
+            self.aanvoer_temp = T_aanvoer
+            self.reden = (f"Delta T = {delta_t:.2f} °C < {self.delta_t_drempel} °C "
+                          f"-> passieve koeling onvoldoende, vloerkoeling AAN")
+        else:
+            self.aan = False
+            self.aanvoer_temp = None
+            self.reden = (f"Delta T = {delta_t:.2f} °C >= {self.delta_t_drempel} °C "
+                          f"-> nachtventilatie volstaat, vloerkoeling UIT")
+
+        return {
+            'aan': self.aan,
+            'aanvoer_temp': self.aanvoer_temp,
+            'dauwpunt_binnen': T_dauw_binnen,
+            'vloer_min': T_vloer_min,
+            'delta_t': delta_t,
+            'reden': self.reden,
+            'waarschuwing': waarschuwing
+        }
+
+    def stuur_arduino(self, ser, resultaat):
+        if ser is None or not ser.is_open:
+            return False
+        try:
+            if resultaat['aan'] and resultaat['aanvoer_temp'] is not None:
+                cmd = f"C,1,{resultaat['aanvoer_temp']:.1f}\n"
+            else:
+                cmd = "C,0,0\n"
+            ser.write(cmd.encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Fout bij sturen Arduino: {e}")
+            return False
+
+
+# ============================================================
+# HOOFD APP
+# ============================================================
+class MollierApp:
+    """Volledige app: binnen/buiten klimaat, gevoelstemperatuur,
+    condensatie, DHT22, vloerkoeling regeling."""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Mollier - Binnen/Buiten Klimaat & Gevoelstemperatuur")
+        self.root.geometry("1600x1000")
+        self.root.resizable(True, True)
+
+        self.psych = Psychrometrie()
+        self.dht_binnen = DHT22Reader()
+        self.dht_buiten = DHT22Reader()
+        self.dht_binnen_connected = False
+        self.dht_buiten_connected = False
+
+        self.vloerkoeling = VloerkoelingController(self.psych)
+        self.arduino_ser = None
+        self.vloerkoeling_resultaat = None
+
+        self.colors = {
+            'bg': '#0a0a1a', 'bg2': '#1a1a2e',
+            'frame_in': '#1e3a5f', 'frame_out': '#2d4a3e',
+            'accent2': '#00d2ff', 'accent3': '#ffd700',
+            'accent5': '#ff6b6b', 'text': '#ffffff', 'text2': '#b0b0b0',
+            'button': '#e94560', 'button_text': 'white',
+            'arduino': '#00979D'
+        }
+
+        self.root.configure(bg=self.colors['bg'])
+        self.V_dot_default = 300
+        self.create_widgets()
+        self.toon_waarden()
+
+    # --------------------------------------------------------
+    def create_widgets(self):
+        main_frame = tk.Frame(self.root, bg=self.colors['bg'])
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Titel
+        title_frame = tk.Frame(main_frame, bg=self.colors['bg2'], height=70)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+        title_frame.pack_propagate(False)
+
+        tk.Label(title_frame, text="BINNEN vs BUITEN KLIMAAT - GEVOELSTEMPERATUUR",
+                 font=('Arial', 18, 'bold'), bg=self.colors['bg2'],
+                 fg=self.colors['accent3']).pack(expand=True)
+        tk.Label(title_frame,
+                 text="Binnenklimaat constant | Buitenklimaat met wind, zon en gevoel | DHT22 + vloerkoeling",
+                 font=('Arial', 10), bg=self.colors['bg2'],
+                 fg=self.colors['accent2']).pack()
+
+        # Panelen
+        left_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        center_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        center_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        right_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # ====================================================
+        # BINNEN SENSOR
+        # ====================================================
+        binnen_frame = tk.Frame(left_panel, bg=self.colors['frame_in'], relief=tk.RAISED, bd=2)
+        binnen_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(binnen_frame, text="BINNEN KLIMAAT",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_in'],
+                 fg='#00ff88').pack(pady=(8, 3))
+
+        port_in_frame = tk.Frame(binnen_frame, bg=self.colors['frame_in'])
+        port_in_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(port_in_frame, text="Poort:", font=('Arial', 9),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+        self.port_in_var = tk.StringVar()
+        self.port_in_combo = ttk.Combobox(port_in_frame, textvariable=self.port_in_var,
+                                          values=DHT22Reader.list_ports(), width=12)
+        self.port_in_combo.pack(side=tk.LEFT, padx=5)
+        tk.Button(port_in_frame, text="R", font=('Arial', 9), bg='#006064',
+                  fg='white', command=self.refresh_ports).pack(side=tk.LEFT, padx=2)
+
+        self.connect_in_btn = tk.Button(binnen_frame, text="VERBIND BINNEN",
+                                        font=('Arial', 10, 'bold'),
+                                        bg='#00695C', fg='white',
+                                        command=lambda: self.toggle_connection('binnen'))
+        self.connect_in_btn.pack(pady=4)
+
+        self.status_in_var = tk.StringVar(value="Binnen niet verbonden")
+        tk.Label(binnen_frame, textvariable=self.status_in_var,
+                 font=('Arial', 9), bg=self.colors['frame_in'],
+                 fg='#FFD54F').pack()
+
+        live_in = tk.Frame(binnen_frame, bg=self.colors['frame_in'])
+        live_in.pack(fill=tk.X, padx=15, pady=8)
+
+        tk.Label(live_in, text="T:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+        self.dht_in_temp = tk.StringVar(value="--.-")
+        tk.Label(live_in, textvariable=self.dht_in_temp, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#00ff88', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_in, text="C", font=('Arial', 10),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+
+        tk.Label(live_in, text="RH:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT, padx=(10, 0))
+        self.dht_in_phi = tk.StringVar(value="--")
+        tk.Label(live_in, textvariable=self.dht_in_phi, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#00ff88', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_in, text="%", font=('Arial', 10),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+
+        # ====================================================
+        # BUITEN SENSOR
+        # ====================================================
+        buiten_frame = tk.Frame(left_panel, bg=self.colors['frame_out'], relief=tk.RAISED, bd=2)
+        buiten_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(buiten_frame, text="BUITEN KLIMAAT",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_out'],
+                 fg='#FFD54F').pack(pady=(8, 3))
+
+        port_out_frame = tk.Frame(buiten_frame, bg=self.colors['frame_out'])
+        port_out_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(port_out_frame, text="Poort:", font=('Arial', 9),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+        self.port_out_var = tk.StringVar()
+        self.port_out_combo = ttk.Combobox(port_out_frame, textvariable=self.port_out_var,
+                                           values=DHT22Reader.list_ports(), width=12)
+        self.port_out_combo.pack(side=tk.LEFT, padx=5)
+        tk.Button(port_out_frame, text="R", font=('Arial', 9), bg='#006064',
+                  fg='white', command=self.refresh_ports).pack(side=tk.LEFT, padx=2)
+
+        self.connect_out_btn = tk.Button(buiten_frame, text="VERBIND BUITEN",
+                                         font=('Arial', 10, 'bold'),
+                                         bg='#00695C', fg='white',
+                                         command=lambda: self.toggle_connection('buiten'))
+        self.connect_out_btn.pack(pady=4)
+
+        self.status_out_var = tk.StringVar(value="Buiten niet verbonden")
+        tk.Label(buiten_frame, textvariable=self.status_out_var,
+                 font=('Arial', 9), bg=self.colors['frame_out'],
+                 fg='#FFD54F').pack()
+
+        live_out = tk.Frame(buiten_frame, bg=self.colors['frame_out'])
+        live_out.pack(fill=tk.X, padx=15, pady=8)
+
+        tk.Label(live_out, text="T:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+        self.dht_out_temp = tk.StringVar(value="--.-")
+        tk.Label(live_out, textvariable=self.dht_out_temp, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#FFD54F', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_out, text="C", font=('Arial', 10),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+
+        tk.Label(live_out, text="RH:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT, padx=(10, 0))
+        self.dht_out_phi = tk.StringVar(value="--")
+        tk.Label(live_out, textvariable=self.dht_out_phi, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#FFD54F', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_out, text="%", font=('Arial', 10),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+
+        # ====================================================
+        # PARAMETERS
+        # ====================================================
+        input_frame = tk.Frame(left_panel, bg=self.colors['bg2'], relief=tk.RAISED, bd=2)
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(input_frame, text="PARAMETERS",
+                 font=('Arial', 11, 'bold'), bg=self.colors['bg2'],
+                 fg=self.colors['accent2']).pack(pady=(8, 5))
+
+        # Binnen
+        tk.Label(input_frame, text="BINNEN:", font=('Arial', 10, 'bold'),
+                 bg=self.colors['bg2'], fg='#00ff88').pack(pady=(5, 2))
+
+        row_in = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_in.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row_in, text="T:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.temp_in_var = tk.StringVar(value="22")
+        tk.Entry(row_in, textvariable=self.temp_in_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_in, text="C   RH:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.phi_in_var = tk.StringVar(value="50")
+        tk.Entry(row_in, textvariable=self.phi_in_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_in, text="%", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Buiten
+        tk.Label(input_frame, text="BUITEN:", font=('Arial', 10, 'bold'),
+                 bg=self.colors['bg2'], fg='#FFD54F').pack(pady=(8, 2))
+
+        row_out = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_out.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row_out, text="T:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.temp_out_var = tk.StringVar(value="15")
+        tk.Entry(row_out, textvariable=self.temp_out_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_out, text="C   RH:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.phi_out_var = tk.StringVar(value="70")
+        tk.Entry(row_out, textvariable=self.phi_out_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_out, text="%", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Wind en zon
+        row_weer = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_weer.pack(fill=tk.X, padx=20, pady=5)
+        tk.Label(row_weer, text="Wind:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.wind_var = tk.StringVar(value="10")
+        tk.Entry(row_weer, textvariable=self.wind_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_weer, text="km/h   Zon:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.solar_var = tk.StringVar(value="0")
+        tk.Entry(row_weer, textvariable=self.solar_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_weer, text="W/m2", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Flow en oppervlak
+        row_flow = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_flow.pack(fill=tk.X, padx=20, pady=5)
+        tk.Label(row_flow, text="Flow:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.flow_var = tk.StringVar(value="300")
+        tk.Entry(row_flow, textvariable=self.flow_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_flow, text="m3/h   Oppervl:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.surf_var = tk.StringVar(value="10")
+        tk.Entry(row_flow, textvariable=self.surf_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_flow, text="C", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        tk.Button(input_frame, text="BEREKEN ALLES",
+                  font=('Arial', 12, 'bold'), bg=self.colors['button'],
+                  fg='white', relief=tk.RAISED, bd=3,
+                  command=self.toon_waarden).pack(pady=10)
+
+        # ====================================================
+        # VLOERKOELING REGELING
+        # ====================================================
+        vk_frame = tk.Frame(input_frame, bg='#2a1a3a', relief=tk.RAISED, bd=2)
+        vk_frame.pack(fill=tk.X, padx=5, pady=(5, 10))
+
+        tk.Label(vk_frame, text="VLOERKOELING REGELING",
+                 font=('Arial', 10, 'bold'), bg='#2a1a3a',
+                 fg='#00d2ff').pack(pady=(6, 3))
+
+        # Modus
+        mode_frame = tk.Frame(vk_frame, bg='#2a1a3a')
+        mode_frame.pack(fill=tk.X, padx=10, pady=3)
+
+        self.regel_modus = tk.StringVar(value="manueel")
+        tk.Radiobutton(mode_frame, text="Manueel", variable=self.regel_modus,
+                       value="manueel", bg='#2a1a3a', fg='white',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       command=self.update_regel_modus).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(mode_frame, text="Arduino", variable=self.regel_modus,
+                       value="arduino", bg='#2a1a3a', fg='white',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       command=self.update_regel_modus).pack(side=tk.LEFT, padx=5)
+
+        # Status
+        self.vk_status_var = tk.StringVar(value="Nog niet berekend")
+        self.vk_status_label = tk.Label(vk_frame, textvariable=self.vk_status_var,
+                                        font=('Arial', 10, 'bold'),
+                                        bg='#2a1a3a', fg='#888',
+                                        wraplength=350, justify=tk.LEFT)
+        self.vk_status_label.pack(pady=5, padx=10)
+
+        self.vk_detail_var = tk.StringVar(value="")
+        tk.Label(vk_frame, textvariable=self.vk_detail_var,
+                 font=('Arial', 8), bg='#2a1a3a', fg='#b0b0b0',
+                 wraplength=350, justify=tk.LEFT).pack(pady=(0, 8), padx=10)
+
+        # Arduino poort
+        arduino_row = tk.Frame(vk_frame, bg='#2a1a3a')
+        arduino_row.pack(fill=tk.X, padx=10, pady=3)
+        tk.Label(arduino_row, text="Arduino poort:", font=('Arial', 8),
+                 bg='#2a1a3a', fg='white').pack(side=tk.LEFT)
+        self.arduino_port_var = tk.StringVar()
+        self.arduino_port_combo = ttk.Combobox(arduino_row,
+                                               textvariable=self.arduino_port_var,
+                                               values=DHT22Reader.list_ports(),
+                                               width=12)
+        self.arduino_port_combo.pack(side=tk.LEFT, padx=5)
+
+        self.arduino_connect_btn = tk.Button(arduino_row, text="Verbind",
+                                             font=('Arial', 8, 'bold'),
+                                             bg='#00695C', fg='white',
+                                             command=self.toggle_arduino)
+        self.arduino_connect_btn.pack(side=tk.LEFT, padx=3)
+
+        # Override
+        override_row = tk.Frame(vk_frame, bg='#2a1a3a')
+        override_row.pack(fill=tk.X, padx=10, pady=3)
+        self.override_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(override_row, text="Forceer vloerkoeling AAN",
+                       variable=self.override_var, bg='#2a1a3a', fg='#ff6b6b',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       font=('Arial', 8),
+                       command=self.toon_waarden).pack(side=tk.LEFT)
+
+        # Opslaan Arduino sketch
+        tk.Button(vk_frame, text="Sketch opslaan als .ino",
+                  font=('Arial', 8), bg='#00979D', fg='white',
+                  command=self.save_arduino_sketch).pack(pady=(0, 6))
+
+        # ====================================================
+        # CENTER — RESULTATEN
+        # ====================================================
+        result_frame = tk.Frame(center_panel, bg=self.colors['frame_in'],
+                                relief=tk.RAISED, bd=2)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(result_frame, text="VERGELIJKING BINNEN vs BUITEN",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_in'],
+                 fg=self.colors['accent2']).pack(pady=(10, 5))
+
+        columns = ('Grootheid', 'Binnen', 'Buiten', 'Eenheid')
+        self.result_tree = ttk.Treeview(result_frame, columns=columns,
+                                        show='headings', height=24)
+
+        self.result_tree.heading('Grootheid', text='Grootheid')
+        self.result_tree.heading('Binnen', text='Binnen')
+        self.result_tree.heading('Buiten', text='Buiten')
+        self.result_tree.heading('Eenheid', text='Eenheid')
+
+        self.result_tree.column('Grootheid', width=200, anchor='w')
+        self.result_tree.column('Binnen', width=100, anchor='e')
+        self.result_tree.column('Buiten', width=100, anchor='e')
+        self.result_tree.column('Eenheid', width=80, anchor='w')
+
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
+                                  command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                              padx=(10, 0), pady=10)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
+
+        # ====================================================
+        # RECHTS — GEVOEL + GRAFIEK
+        # ====================================================
+        tk.Label(right_panel, text="GEVOELSTEMPERATUUR ANALYSE",
+                 font=('Arial', 11, 'bold'), bg=self.colors['bg'],
+                 fg=self.colors['accent2']).pack(pady=(0, 10))
+
+        self.canvas = tk.Canvas(right_panel, bg='#0a0a1a', relief=tk.SUNKEN,
+                                bd=2, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        binnen_info = tk.Frame(right_panel, bg='#1a3a2e', relief=tk.RAISED, bd=2)
+        binnen_info.pack(fill=tk.X, pady=(0, 5))
+
+        tk.Label(binnen_info, text="BINNEN GEVOELSTEMPERATUUR",
+                 font=('Arial', 10, 'bold'), bg='#1a3a2e',
+                 fg='#00ff88').pack(pady=(5, 2))
+
+        self.binnen_status = tk.Label(binnen_info, text="", font=('Arial', 9),
+                                      bg='#1a3a2e', fg=self.colors['text2'],
+                                      wraplength=380, justify=tk.LEFT)
+        self.binnen_status.pack(pady=(0, 8), padx=10)
+
+        buiten_info = tk.Frame(right_panel, bg='#3a2e1a', relief=tk.RAISED, bd=2)
+        buiten_info.pack(fill=tk.X, pady=(0, 5))
+
+        tk.Label(buiten_info, text="BUITEN GEVOELSTEMPERATUUR",
+                 font=('Arial', 10, 'bold'), bg='#3a2e1a',
+                 fg='#FFD54F').pack(pady=(5, 2))
+
+        self.buiten_status = tk.Label(buiten_info, text="", font=('Arial', 9),
+                                      bg='#3a2e1a', fg=self.colors['text2'],
+                                      wraplength=380, justify=tk.LEFT)
+        self.buiten_status.pack(pady=(0, 8), padx=10)
+
+        # Statusbalk
+        self.status_var = tk.StringVar(value="Klaar voor analyse...")
+        tk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN,
+                 anchor=tk.W, font=('Arial', 9), bg=self.colors['bg2'],
+                 fg=self.colors['text2']).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Traces
+        for var in [self.temp_in_var, self.phi_in_var, self.temp_out_var,
+                    self.phi_out_var, self.wind_var, self.solar_var,
+                    self.flow_var, self.surf_var]:
+            var.trace_add('write', lambda *args: self.toon_waarden())
+
+    # --------------------------------------------------------
+    # DHT22 / Arduino functies
+    # --------------------------------------------------------
+    def refresh_ports(self):
+        if not SERIAL_AVAILABLE:
+            messagebox.showwarning("pyserial niet gevonden",
+                                   "Installeer pyserial:\n\npip install pyserial")
+            return
+        ports = DHT22Reader.list_ports()
+        self.port_in_combo['values'] = ports
+        self.port_out_combo['values'] = ports
+        self.arduino_port_combo['values'] = ports
+        if len(ports) >= 1 and not self.port_in_var.get():
+            self.port_in_var.set(ports[0])
+        if len(ports) >= 2 and not self.port_out_var.get():
+            self.port_out_var.set(ports[1])
+        if len(ports) >= 1 and not self.arduino_port_var.get():
+            self.arduino_port_var.set(ports[0])
+        self.status_var.set(f"{len(ports)} poort(en) gevonden")
+
+    def toggle_connection(self, locatie):
+        if locatie == 'binnen':
+            if self.dht_binnen_connected:
+                self.dht_binnen.disconnect()
+                self.dht_binnen_connected = False
+                self.connect_in_btn.config(text="VERBIND BINNEN", bg='#00695C')
+                self.status_in_var.set("Binnen niet verbonden")
+            else:
+                self._connect(locatie)
+        else:
+            if self.dht_buiten_connected:
+                self.dht_buiten.disconnect()
+                self.dht_buiten_connected = False
+                self.connect_out_btn.config(text="VERBIND BUITEN", bg='#00695C')
+                self.status_out_var.set("Buiten niet verbonden")
+            else:
+                self._connect(locatie)
+
+    def _connect(self, locatie):
+        if not SERIAL_AVAILABLE:
+            messagebox.showerror("Fout", "pyserial niet geïnstalleerd.\n\npip install pyserial")
+            return
+        port = self.port_in_var.get() if locatie == 'binnen' else self.port_out_var.get()
+        if not port:
+            messagebox.showwarning("Geen poort", f"Selecteer poort voor {locatie}.")
+            return
+        try:
+            if locatie == 'binnen':
+                self.dht_binnen.connect(port)
+                self.dht_binnen_connected = True
+                self.connect_in_btn.config(text="VERBREEK BINNEN", bg='#c62828')
+                self.status_in_var.set(f"Binnen: {port}")
+                self.dht_binnen.start_reading(self.on_dht_binnen)
+            else:
+                self.dht_buiten.connect(port)
+                self.dht_buiten_connected = True
+                self.connect_out_btn.config(text="VERBREEK BUITEN", bg='#c62828')
+                self.status_out_var.set(f"Buiten: {port}")
+                self.dht_buiten.start_reading(self.on_dht_buiten)
+            self.status_var.set(f"{locatie.capitalize()} verbonden op {port}")
+        except Exception as e:
+            messagebox.showerror("Verbindingsfout", f"Kon niet verbinden:\n{str(e)}")
+
+    def on_dht_binnen(self, T, phi):
+        self.root.after(0, lambda: self._update_dht_in(T, phi))
+
+    def on_dht_buiten(self, T, phi):
+        self.root.after(0, lambda: self._update_dht_out(T, phi))
+
+    def _update_dht_in(self, T, phi):
+        self.dht_in_temp.set(f"{T:.1f}")
+        self.dht_in_phi.set(f"{phi:.0f}")
+        if self.regel_modus.get() == 'arduino':
+            self.temp_in_var.set(f"{T:.1f}")
+            self.phi_in_var.set(f"{phi:.0f}")
+
+    def _update_dht_out(self, T, phi):
+        self.dht_out_temp.set(f"{T:.1f}")
+        self.dht_out_phi.set(f"{phi:.0f}")
+        if self.regel_modus.get() == 'arduino':
+            self.temp_out_var.set(f"{T:.1f}")
+            self.phi_out_var.set(f"{phi:.0f}")
+
+    # --------------------------------------------------------
+    # Vloerkoeling
+    # --------------------------------------------------------
+    def update_regel_modus(self):
+        modus = self.regel_modus.get()
+        if modus == 'manueel':
+            if self.arduino_ser and self.arduino_ser.is_open:
+                self.arduino_ser.close()
+            self.arduino_ser = None
+            self.arduino_connect_btn.config(text="Verbind", bg='#00695C')
+            self.status_var.set("Manuele modus: waarden worden gebruikt voor berekening")
+        else:
+            self.status_var.set("Arduino modus: sensorwaarden komen van Arduino")
+        self.toon_waarden()
+
+    def toggle_arduino(self):
+        if self.arduino_ser and self.arduino_ser.is_open:
+            self.arduino_ser.close()
+            self.arduino_ser = None
+            self.arduino_connect_btn.config(text="Verbind", bg='#00695C')
+            self.status_var.set("Arduino regeling verbroken")
+            return
+        if not SERIAL_AVAILABLE:
+            messagebox.showerror("Fout", "pyserial niet geïnstalleerd")
+            return
+        port = self.arduino_port_var.get()
+        if not port:
+            messagebox.showwarning("Geen poort", "Selecteer een Arduino poort.")
+            return
+        try:
+            self.arduino_ser = serial.Serial(port, 9600, timeout=1)
+            time.sleep(2)
+            self.arduino_connect_btn.config(text="Verbreek", bg='#c62828')
+            self.status_var.set(f"Arduino regeling verbonden op {port}")
+        except Exception as e:
+            messagebox.showerror("Fout", f"Kon Arduino niet verbinden:\n{e}")
+
+    def update_vloerkoeling(self, T_in, phi_in, T_out, phi_out):
+        resultaat = self.vloerkoeling.bereken(T_in, phi_in, T_out, phi_out)
+        self.vloerkoeling_resultaat = resultaat
+
+        if self.override_var.get():
+            resultaat['aan'] = True
+            if resultaat['aanvoer_temp'] is None:
+                T_dauw = resultaat.get('dauwpunt_binnen')
+                resultaat['aanvoer_temp'] = (T_dauw + 1.5 - 2.0) if T_dauw else 12.0
+            resultaat['reden'] = "HANDMATIG GEFORCEERD AAN"
+
+        if resultaat['aan']:
+            self.vk_status_var.set(
+                f"VLOERKOELING AAN\n"
+                f"   Aanvoertemperatuur: {resultaat['aanvoer_temp']:.1f} C"
+            )
+            self.vk_status_label.config(fg='#00ff88')
+        else:
+            self.vk_status_var.set("VLOERKOELING UIT")
+            self.vk_status_label.config(fg='#ff6b6b')
+
+        detail = resultaat['reden']
+        if resultaat.get('dauwpunt_binnen') is not None:
+            detail += f"\nDauwpunt binnen: {resultaat['dauwpunt_binnen']:.1f} C"
+        if 'vloer_min' in resultaat:
+            detail += f"\nMin. vloertemperatuur: {resultaat['vloer_min']:.1f} C"
+        if resultaat.get('waarschuwing'):
+            detail += f"\n{resultaat['waarschuwing']}"
+        self.vk_detail_var.set(detail)
+
+        if (self.regel_modus.get() == 'arduino'
+                and self.arduino_ser and self.arduino_ser.is_open):
+            self.vloerkoeling.stuur_arduino(self.arduino_ser, resultaat)
+
+    def save_arduino_sketch(self):
+        pad = filedialog.asksaveasfilename(
+            defaultextension=".ino",
+            filetypes=[("Arduino sketch", "*.ino"), ("Alle bestanden", "*.*")],
+            initialfile="vloerkoeling.ino"
+        )
+        if pad:
+            try:
+                with open(pad, 'w', encoding='utf-8') as f:
+                    f.write(ARDUINO_SKETCH)
+                messagebox.showinfo("Opgeslagen",
+                                    f"Arduino sketch opgeslagen:\n{pad}\n\n"
+                                    f"Open dit bestand in de Arduino IDE.")
+            except Exception as e:
+                messagebox.showerror("Fout", f"Kon niet opslaan:\n{e}")
+
+    # --------------------------------------------------------
+    # Berekeningen
+    # --------------------------------------------------------
+    def toon_waarden(self):
+        try:
+            T_in = float(self.temp_in_var.get())
+            phi_in = float(self.phi_in_var.get())
+            T_out = float(self.temp_out_var.get())
+            phi_out = float(self.phi_out_var.get())
+            wind = float(self.wind_var.get())
+            solar = float(self.solar_var.get())
+            V_dot = float(self.flow_var.get())
+            T_surf = float(self.surf_var.get())
+
+            res_in = self.psych.alle_grootheden(T_in, phi_in, V_dot, 0, 0)
+            res_out = self.psych.alle_grootheden(T_out, phi_out, V_dot, wind, solar)
+
+            m_cond_in, T_d_in, heeft_in = self.psych.condensatie_hoeveelheid(
+                V_dot, T_in, phi_in, T_surf)
+            m_cond_out, T_d_out, heeft_out = self.psych.condensatie_hoeveelheid(
+                V_dot, T_out, phi_out, T_surf)
+
+            self.result_tree.delete(*self.result_tree.get_children())
+
+            self.update_vloerkoeling(T_in, phi_in, T_out, phi_out)
+            vk = self.vloerkoeling_resultaat
+
+            rows = [
+                ('--- BASISPARAMETERS ---', '', '', ''),
+                ('Temperatuur', f"{T_in:.1f}", f"{T_out:.1f}", 'C'),
+                ('Relatieve vochtigheid', f"{phi_in:.0f}", f"{phi_out:.0f}", '%'),
+                ('Absolute vochtigheid', f"{res_in['x']:.4f}", f"{res_out['x']:.4f}", 'kg/kg'),
+                ('Dichtheid', f"{res_in['rho']:.3f}", f"{res_out['rho']:.3f}", 'kg/m3'),
+                ('', '', '', ''),
+                ('--- PSYCHROMETRISCH ---', '', '', ''),
+                ('Dauwpunt',
+                 f"{res_in['T_dauw']:.1f}" if res_in['T_dauw'] else '--',
+                 f"{res_out['T_dauw']:.1f}" if res_out['T_dauw'] else '--', 'C'),
+                ('Natte-bol temperatuur', f"{res_in['T_wb']:.1f}",
+                 f"{res_out['T_wb']:.1f}", 'C'),
+                ('Enthalpie', f"{res_in['h']:.1f}", f"{res_out['h']:.1f}", 'kJ/kg'),
+                ('Waterstroom', f"{res_in['m_dot_water']:.3f}",
+                 f"{res_out['m_dot_water']:.3f}", 'kg/h'),
+                ('', '', '', ''),
+                ('--- GEVOELSTEMPERATUUR ---', '', '', ''),
+                ('Gevoelstemperatuur',
+                 f"{res_in['gevoel_binnen']['gevoel']:.1f}",
+                 f"{res_out['gevoel_buiten']['gevoel']:.1f}", 'C'),
+                ('Humidex',
+                 f"{res_in['gevoel_binnen']['humidex']:.1f}",
+                 f"{res_out['gevoel_buiten']['humidex']:.1f}", 'C'),
+                ('Apparent Temp',
+                 f"{res_in['gevoel_binnen']['apparent']:.1f}",
+                 f"{res_out['gevoel_buiten']['apparent']:.1f}", 'C'),
+                ('Heat Index', '--',
+                 f"{res_out['gevoel_buiten']['heat_index']:.1f}", 'C'),
+                ('Wind Chill', '--',
+                 f"{res_out['gevoel_buiten']['wind_chill']:.1f}", 'C'),
+                ('Methode', res_in['gevoel_binnen']['methode'][:20],
+                 res_out['gevoel_buiten']['methode'][:20], ''),
+                ('', '', '', ''),
+                ('--- CONDENSATIE ---', '', '', ''),
+                ('Condensatie', f"{m_cond_in:.3f}", f"{m_cond_out:.3f}", 'kg/h'),
+                ('Condensatie/dag', f"{m_cond_in * 24:.2f}",
+                 f"{m_cond_out * 24:.2f}", 'kg/dag'),
+                ('Status', 'JA' if heeft_in else 'NEE',
+                 'JA' if heeft_out else 'NEE', ''),
+                ('', '', '', ''),
+                ('--- VLOERKOELING ---', '', '', ''),
+                ('Delta T (binnen-buiten)', f"{T_in - T_out:+.2f}", '', 'C'),
+                ('Vloerkoeling',
+                 'AAN' if (vk and vk['aan']) else 'UIT', '', ''),
+                ('Aanvoertemperatuur',
+                 f"{vk['aanvoer_temp']:.1f}"
+                 if (vk and vk.get('aanvoer_temp')) else '--', '', 'C'),
+                ('Dauwpunt binnen',
+                 f"{vk['dauwpunt_binnen']:.1f}"
+                 if (vk and vk.get('dauwpunt_binnen')) else '--', '', 'C'),
+            ]
+
+            for row in rows:
+                item = self.result_tree.insert('', tk.END, values=row)
+                if '---' in row[0]:
+                    self.result_tree.tag_configure('header',
+                                                   background='#2d1b4e',
+                                                   foreground='#ffd700')
+                    self.result_tree.item(item, tags=('header',))
+                elif 'GEVOELSTEMPERATUUR' in row[0]:
+                    self.result_tree.tag_configure('gevoel',
+                                                   background='#1f3d2f',
+                                                   foreground='#00ff88')
+                    self.result_tree.item(item, tags=('gevoel',))
+                elif 'VLOERKOELING' in row[0] or 'Aanvoer' in row[0]:
+                    self.result_tree.tag_configure('vk',
+                                                   background='#2a1a3a',
+                                                   foreground='#00d2ff')
+                    self.result_tree.item(item, tags=('vk',))
+
+            self.update_binnen_info(res_in, T_in, phi_in)
+            self.update_buiten_info(res_out, T_out, phi_out, wind, solar)
+
+            self.status_var.set(
+                f"Binnen: {T_in:.1f} C (gevoel "
+                f"{res_in['gevoel_binnen']['gevoel']:.1f} C) | "
+                f"Buiten: {T_out:.1f} C (gevoel "
+                f"{res_out['gevoel_buiten']['gevoel']:.1f} C) | "
+                f"Delta T = {T_in - T_out:+.2f} C"
+            )
+
+            self.teken_grafiek(res_in, res_out, T_in, T_out, phi_in, phi_out)
+
+        except ValueError as e:
+            messagebox.showerror("Fout", f"Voer geldige numerieke waarden in.\n{str(e)}")
+        except Exception as e:
+            messagebox.showerror("Fout", f"Fout: {str(e)}")
+
+    def update_binnen_info(self, res, T, phi):
+        g = res['gevoel_binnen']
+        lines = [
+            f"Temperatuur: {T:.1f} C",
+            f"Vochtigheid: {phi:.0f}%",
+            f"Dauwpunt: {g['T_dauw']:.1f} C",
+            "",
+            f"GEVOELSTEMPERATUUR: {g['gevoel']:.1f} C",
+            f"   Humidex: {g['humidex']:.1f} C",
+            f"   Apparent Temp: {g['apparent']:.1f} C",
+            f"   Methode: {g['methode']}",
+            "",
+            "Binnenklimaat is constant:",
+        ]
+        if T < 18:
+            lines.append("   Te koud - verhoog verwarming")
+        elif T > 26:
+            lines.append("   Te warm - verhoog ventilatie")
+        elif 20 <= T <= 24 and 40 <= phi <= 60:
+            lines.append("   Comfortabel binnenklimaat")
+        else:
+            lines.append("   Acceptabel binnenklimaat")
+        self.binnen_status.config(text="\n".join(lines))
+
+    def update_buiten_info(self, res, T, phi, wind, solar):
+        g = res['gevoel_buiten']
+        lines = [
+            f"Temperatuur: {T:.1f} C",
+            f"Vochtigheid: {phi:.0f}%",
+            f"Dauwpunt: {g['T_dauw']:.1f} C",
+            f"Wind: {wind:.0f} km/h",
+            f"Zon: {solar:.0f} W/m2",
+            "",
+            f"GEVOELSTEMPERATUUR: {g['gevoel']:.1f} C",
+            f"   Heat Index: {g['heat_index']:.1f} C",
+            f"   Wind Chill: {g['wind_chill']:.1f} C",
+            f"   Apparent Temp: {g['apparent']:.1f} C",
+            f"   Humidex: {g['humidex']:.1f} C",
+            f"   Methode: {g['methode']}",
+            "",
+        ]
+        verschil = g['gevoel'] - T
+        if verschil > 3:
+            lines.append(f"Voelt {verschil:.1f} C WARMER aan")
+            lines.append("   Hoge luchtvochtigheid / weinig wind")
+        elif verschil < -3:
+            lines.append(f"Voelt {abs(verschil):.1f} C KOUDER aan")
+            lines.append("   Wind chill effect / weinig zon")
+        else:
+            lines.append("Voelt ongeveer hetzelfde aan")
+        self.buiten_status.config(text="\n".join(lines))
+
+    def teken_grafiek(self, res_in, res_out, T_in, T_out, phi_in, phi_out):
+        self.canvas.delete("all")
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width < 10 or height < 10:
+            return
+
+        margin = 60
+        plot_width = width - 2 * margin
+        plot_height = height - 2 * margin
+
+        self.canvas.create_rectangle(0, 0, width, height, fill='#0a0a1a')
+        self.canvas.create_line(margin, margin, margin, height - margin,
+                                width=3, fill='#00d2ff')
+        self.canvas.create_line(margin, height - margin, width - margin,
+                                height - margin, width=3, fill='#00d2ff')
+
+        self.canvas.create_text(margin - 15, height // 2, text="h (kJ/kg)",
+                                angle=90, font=('Arial', 10, 'bold'),
+                                fill='#00d2ff')
+        self.canvas.create_text(width // 2, height - margin + 25,
+                                text="Vochtgehalte x (kg/kg)",
+                                font=('Arial', 10, 'bold'), fill='#00d2ff')
+        self.canvas.create_text(width // 2, margin - 20,
+                                text="BINNEN vs BUITEN KLIMAAT",
+                                font=('Arial', 12, 'bold'), fill='#ffd700')
+
+        x_max = 0.035
+        h_max = 120
+        x_scale = plot_width / x_max
+        h_scale = plot_height / h_max * 0.9
+
+        # Verzadigingslijn
+        for temp in range(-10, 51, 1):
+            try:
+                p_sat = self.psych.p_sat(temp)
+                x = self.psych.x_uit_pv(p_sat)
+                h = self.psych.enthalpie(temp, x)
+                if 0 <= x <= x_max and 0 <= h <= h_max and temp > -10:
+                    p_sat_p = self.psych.p_sat(temp - 1)
+                    x_p = self.psych.x_uit_pv(p_sat_p)
+                    h_p = self.psych.enthalpie(temp - 1, x_p)
+                    if 0 <= x_p <= x_max and 0 <= h_p <= h_max:
+                        px1 = margin + x_p * x_scale
+                        py1 = height - margin - h_p * h_scale
+                        px2 = margin + x * x_scale
+                        py2 = height - margin - h * h_scale
+                        self.canvas.create_line(px1, py1, px2, py2,
+                                                fill='#e94560', width=3)
+            except Exception:
+                continue
+
+        # RH lijnen
+        for phi_val in [20, 40, 60, 80]:
+            for temp in range(-10, 51, 2):
+                try:
+                    p_sat = self.psych.p_sat(temp)
+                    p_v = (phi_val / 100.0) * p_sat
+                    x = self.psych.x_uit_pv(p_v)
+                    h = self.psych.enthalpie(temp, x)
+                    if 0 <= x <= x_max and 0 <= h <= h_max:
+                        p_sat_p = self.psych.p_sat(temp - 2)
+                        p_v_p = (phi_val / 100.0) * p_sat_p
+                        x_p = self.psych.x_uit_pv(p_v_p)
+                        h_p = self.psych.enthalpie(temp - 2, x_p)
+                        if 0 <= x_p <= x_max and 0 <= h_p <= h_max:
+                            px1 = margin + x_p * x_scale
+                            py1 = height - margin - h_p * h_scale
+                            px2 = margin + x * x_scale
+                            py2 = height - margin - h * h_scale
+                            self.canvas.create_line(px1, py1, px2, py2,
+                                                    fill='#3498db', width=1,
+                                                    dash=(3, 3))
+                except Exception:
+                    continue
+
+        # Binnen punt
+        if 0 <= res_in['x'] <= x_max and 0 <= res_in['h'] <= h_max:
+            px = margin + res_in['x'] * x_scale
+            py = height - margin - res_in['h'] * h_scale
+            self.canvas.create_oval(px - 10, py - 10, px + 10, py + 10,
+                                    fill='#00ff88', outline='white', width=2)
+            self.canvas.create_rectangle(px + 15, py - 40, px + 175, py + 10,
+                                         fill='#1a3a2e', outline='#00ff88')
+            self.canvas.create_text(
+                px + 20, py - 35,
+                text=f"BINNEN\n{res_in['T']:.1f} C, RH={res_in['phi']:.0f}%\n"
+                     f"Gevoel: {res_in['gevoel_binnen']['gevoel']:.1f} C",
+                anchor='w', font=('Arial', 8), fill='#00ff88')
+
+        # Buiten punt
+        if 0 <= res_out['x'] <= x_max and 0 <= res_out['h'] <= h_max:
+            px = margin + res_out['x'] * x_scale
+            py = height - margin - res_out['h'] * h_scale
+            self.canvas.create_oval(px - 10, py - 10, px + 10, py + 10,
+                                    fill='#FFD54F', outline='white', width=2)
+            self.canvas.create_rectangle(px + 15, py - 40, px + 185, py + 10,
+                                         fill='#3a2e1a', outline='#FFD54F')
+            self.canvas.create_text(
+                px + 20, py - 35,
+                text=f"BUITEN\n{res_out['T']:.1f} C, RH={res_out['phi']:.0f}%\n"
+                     f"Gevoel: {res_out['gevoel_buiten']['gevoel']:.1f} C",
+                anchor='w', font=('Arial', 8), fill='#FFD54F')
+
+        # Verbindingslijn
+        if (0 <= res_in['x'] <= x_max and 0 <= res_in['h'] <= h_max and
+                0 <= res_out['x'] <= x_max and 0 <= res_out['h'] <= h_max):
+            px1 = margin + res_in['x'] * x_scale
+            py1 = height - margin - res_in['h'] * h_scale
+            px2 = margin + res_out['x'] * x_scale
+            py2 = height - margin - res_out['h'] * h_scale
+            self.canvas.create_line(px1, py1, px2, py2, fill='#ff6bff',
+                                    width=2, dash=(6, 4))
+
+        # Legenda
+        lx, ly = margin + 10, margin + 10
+        self.canvas.create_rectangle(lx, ly, lx + 200, ly + 80,
+                                     fill='#1a1a2e', outline='#00d2ff')
+        self.canvas.create_text(lx + 10, ly + 15, text="LEGENDA", anchor='w',
+                                font=('Arial', 9, 'bold'), fill='#ffd700')
+
+        self.canvas.create_oval(lx + 10, ly + 28, lx + 25, ly + 43,
+                                fill='#00ff88', outline='white')
+        self.canvas.create_text(lx + 35, ly + 35, text="Binnen klimaat",
+                                anchor='w', font=('Arial', 8), fill='#00ff88')
+
+        self.canvas.create_oval(lx + 10, ly + 48, lx + 25, ly + 63,
+                                fill='#FFD54F', outline='white')
+        self.canvas.create_text(lx + 35, ly + 55, text="Buiten klimaat",
+                                anchor='w', font=('Arial', 8), fill='#FFD54F')
+
+        self.canvas.create_line(lx + 10, ly + 73, lx + 25, ly + 73,
+                                fill='#ff6bff', width=2, dash=(6, 4))
+        self.canvas.create_text(lx + 35, ly + 73, text="Vergelijking",
+                                anchor='w', font=('Arial', 8), fill='#ff6bff')
+
+    def on_resize(self, event):
+        try:
+            self.toon_waarden()
+        except Exception:
+            pass
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MollierApp(root)
+    root.bind('<Configure>', app.on_resize)
+    root.mainloop()
