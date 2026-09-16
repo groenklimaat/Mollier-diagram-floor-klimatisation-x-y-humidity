@@ -1,0 +1,73 @@
+// Arduino vloerkoeling regeling
+// Ontvangt: "C,<0|1>,<aanvoertemp>\n"
+//           "S\n" → status
+// Stuurt:   "ACK\n" of "STATUS,<aan>,<temp>\n"
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS 2
+#define RELAIS_PIN 8
+#define LED_PIN 13
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+bool koelingAan = false;
+float aanvoerTemp = 0.0;
+
+void setup() {
+  Serial.begin(9600);
+  sensors.begin();
+  pinMode(RELAIS_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(RELAIS_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("READY");
+}
+
+void loop() {
+  // Lees commando's
+  if (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    
+    if (line.startsWith("C,")) {
+      // C,1,12.5  of  C,0,0
+      int eerste = line.indexOf(',');
+      int tweede = line.indexOf(',', eerste + 1);
+      int aan = line.substring(eerste + 1, tweede).toInt();
+      float temp = line.substring(tweede + 1).toFloat();
+      
+      if (aan == 1) {
+        koelingAan = true;
+        aanvoerTemp = temp;
+        digitalWrite(RELAIS_PIN, HIGH);
+        digitalWrite(LED_PIN, HIGH);
+      } else {
+        koelingAan = false;
+        digitalWrite(RELAIS_PIN, LOW);
+        digitalWrite(LED_PIN, LOW);
+      }
+      Serial.println("ACK");
+    }
+    else if (line == "S") {
+      Serial.print("STATUS,");
+      Serial.print(koelingAan ? 1 : 0);
+      Serial.print(",");
+      Serial.println(aanvoerTemp, 1);
+    }
+  }
+  
+  // Optioneel: stuur sensordata periodiek
+  static unsigned long laatste = 0;
+  if (millis() - laatste > 5000) {
+    laatste = millis();
+    sensors.requestTemperatures();
+    float t = sensors.getTempCByIndex(0);
+    if (t > -100) {
+      Serial.print("T,");
+      Serial.println(t, 1);
+    }
+  }
+}
