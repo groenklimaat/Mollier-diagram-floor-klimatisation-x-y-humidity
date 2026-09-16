@@ -1,68 +1,88 @@
-// Arduino vloerkoeling regeling
-// Ontvangt: "C,<0|1>,<aanvoertemp>\n"
-//           "S\n" → status
-// Stuurt:   "ACK\n" of "STATUS,<aan>,<temp>\n"
+# mollier_app.py
+# Mollier diagram + indoor/outdoor climate + feels-like temperature
+# + floor cooling control (manual or via Arduino)
+# Python only — the Arduino sketch is stored below as a string.
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import math
+import threading
+import time
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+
+# ============================================================
+# ARDUINO SKETCH (stored as string so we can save it as .ino)
+# ============================================================
+ARDUINO_SKETCH = r'''// vloerkoeling.ino
+// Arduino floor cooling controller
+// Receives over Serial:  C,<0|1>,<supply_temp>\n
+//                        S\n  (request status)
+// Replies:               ACK\n  or  STATUS,<on>,<temp>\n
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 #define ONE_WIRE_BUS 2
-#define RELAIS_PIN 8
-#define LED_PIN 13
+#define RELAY_PIN    8
+#define LED_PIN      13
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-bool koelingAan = false;
-float aanvoerTemp = 0.0;
+bool  coolingOn    = false;
+float supplyTemp   = 0.0;
 
 void setup() {
   Serial.begin(9600);
   sensors.begin();
-  pinMode(RELAIS_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(RELAIS_PIN, LOW);
+  digitalWrite(RELAY_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
   Serial.println("READY");
 }
 
 void loop() {
-  // Lees commando's
   if (Serial.available() > 0) {
     String line = Serial.readStringUntil('\n');
     line.trim();
-    
+
     if (line.startsWith("C,")) {
-      // C,1,12.5  of  C,0,0
-      int eerste = line.indexOf(',');
-      int tweede = line.indexOf(',', eerste + 1);
-      int aan = line.substring(eerste + 1, tweede).toInt();
-      float temp = line.substring(tweede + 1).toFloat();
-      
-      if (aan == 1) {
-        koelingAan = true;
-        aanvoerTemp = temp;
-        digitalWrite(RELAIS_PIN, HIGH);
+      int first  = line.indexOf(',');
+      int second = line.indexOf(',', first + 1);
+      int on     = line.substring(first + 1, second).toInt();
+      float temp = line.substring(second + 1).toFloat();
+
+      if (on == 1) {
+        coolingOn  = true;
+        supplyTemp = temp;
+        digitalWrite(RELAY_PIN, HIGH);
         digitalWrite(LED_PIN, HIGH);
       } else {
-        koelingAan = false;
-        digitalWrite(RELAIS_PIN, LOW);
+        coolingOn = false;
+        digitalWrite(RELAY_PIN, LOW);
         digitalWrite(LED_PIN, LOW);
       }
       Serial.println("ACK");
     }
     else if (line == "S") {
       Serial.print("STATUS,");
-      Serial.print(koelingAan ? 1 : 0);
+      Serial.print(coolingOn ? 1 : 0);
       Serial.print(",");
-      Serial.println(aanvoerTemp, 1);
+      Serial.println(supplyTemp, 1);
     }
   }
-  
-  // Optioneel: stuur sensordata periodiek
-  static unsigned long laatste = 0;
-  if (millis() - laatste > 5000) {
-    laatste = millis();
+
+  static unsigned long last = 0;
+  if (millis() - last > 5000) {
+    last = millis();
     sensors.requestTemperatures();
     float t = sensors.getTempCByIndex(0);
     if (t > -100) {
@@ -71,3 +91,1219 @@ void loop() {
     }
   }
 }
+'''
+
+
+# ============================================================
+# PSYCHROMETRICS
+# ============================================================
+class Psychrometrics:
+    """Psychrometric calculations with condensation and feels-like temperature."""
+
+    def __init__(self, p_atm=101325):
+        self.p_atm = p_atm
+        self.c_pa = 1.006
+        self.h_we = 2501
+        self.c_pv = 1.86
+        self.R_air = 287.05
+
+    def p_sat(self, T):
+        return 610.78 * math.exp(17.27 * T / (T + 237.3))
+
+    def x_from_pv(self, p_v):
+        return 0.62198 * p_v / (self.p_atm - p_v)
+
+    def enthalpy(self, T, x):
+        return self.c_pa * T + x * (self.h_we + self.c_pv * T)
+
+    def dew_point(self, p_v):
+        if p_v <= 0:
+            return None
+        try:
+            return (237.3 * math.log(p_v / 610.78)) / (17.27 - math.log(p_v / 610.78))
+        except Exception:
+            return None
+
+    def dew_point_from_T_rh(self, T, rh):
+        p_v = (rh / 100.0) * self.p_sat(T)
+        return self.dew_point(p_v)
+
+    def wet_bulb_temperature(self, T, rh):
+        p_v = (rh / 100.0) * self.p_sat(T)
+        x = self.x_from_pv(p_v)
+        h = self.enthalpy(T, x)
+        Twb = T - 5
+        for _ in range(50):
+            p_sat_wb = self.p_sat(Twb)
+            x_wb = self.x_from_pv(p_sat_wb)
+            h_wb = self.enthalpy(Twb, x_wb)
+            delta_h = h - h_wb
+            if abs(delta_h) < 0.001:
+                break
+            Twb = Twb + delta_h / 4.0
+            if Twb < -10:
+                Twb = -10
+                break
+        return Twb
+
+    def density(self, T, x):
+        T_K = T + 273.15
+        p_v = x * self.p_atm / (0.62198 + x)
+        p_dry = self.p_atm - p_v
+        return (p_dry / (self.R_air * T_K)) * (1 + x)
+
+    # ---------------- FEELS-LIKE TEMPERATURE ----------------
+
+    def heat_index(self, T, rh):
+        T_F = T * 9 / 5 + 32
+        if T_F < 80:
+            return T
+        HI_F = (-42.379
+                + 2.04901523 * T_F
+                + 10.14333127 * rh
+                - 0.22475541 * T_F * rh
+                - 0.00683783 * T_F ** 2
+                - 0.05481717 * rh ** 2
+                + 0.00122874 * T_F ** 2 * rh
+                + 0.00085282 * T_F * rh ** 2
+                - 0.00000199 * T_F ** 2 * rh ** 2)
+        if rh < 13 and 80 <= T_F <= 112:
+            HI_F -= ((13 - rh) / 4) * math.sqrt((17 - abs(T_F - 95)) / 17)
+        if rh > 85 and 80 <= T_F <= 87:
+            HI_F += ((rh - 85) / 10) * ((87 - T_F) / 5)
+        return (HI_F - 32) * 5 / 9
+
+    def wind_chill(self, T, wind_speed_kmh):
+        if T > 10 or wind_speed_kmh < 4.8:
+            return T
+        return (13.12 + 0.6215 * T
+                - 11.37 * (wind_speed_kmh ** 0.16)
+                + 0.3965 * T * (wind_speed_kmh ** 0.16))
+
+    def humidex(self, T, T_dew):
+        if T_dew is None:
+            return T
+        e = 6.11 * math.exp(5417.7530 * (1 / 273.16 - 1 / (T_dew + 273.15)))
+        return T + 0.5555 * (e - 10)
+
+    def apparent_temperature(self, T, rh, wind_speed_ms=0, solar_radiation=0):
+        e = (rh / 100.0) * 6.105 * math.exp(17.27 * T / (237.7 + T))
+        AT = T + 0.33 * e - 0.70 * wind_speed_ms - 4.00
+        if solar_radiation > 0:
+            AT += 0.0042 * solar_radiation
+        return AT
+
+    def feels_like_indoor(self, T, rh):
+        T_dew = self.dew_point_from_T_rh(T, rh)
+        hx = self.humidex(T, T_dew)
+        at = self.apparent_temperature(T, rh, 0, 0)
+        if T >= 20:
+            feels = 0.5 * hx + 0.5 * at
+            method = "Humidex + Apparent Temp (indoor)"
+        else:
+            feels = T
+            method = "None (comfortable)"
+        return {'feels': feels, 'humidex': hx, 'apparent': at,
+                'T_dew': T_dew, 'method': method}
+
+    def feels_like_outdoor(self, T, rh, wind_speed_kmh=5, solar_radiation=0):
+        wind_speed_ms = wind_speed_kmh / 3.6
+        T_dew = self.dew_point_from_T_rh(T, rh)
+        if T >= 27:
+            hi = self.heat_index(T, rh)
+            at = self.apparent_temperature(T, rh, wind_speed_ms, solar_radiation)
+            feels = 0.4 * hi + 0.6 * at
+            method = "Heat Index + Apparent Temp (warm)"
+        elif T <= 10 and wind_speed_kmh > 4.8:
+            wc = self.wind_chill(T, wind_speed_kmh)
+            at = self.apparent_temperature(T, rh, wind_speed_ms, solar_radiation)
+            feels = 0.6 * wc + 0.4 * at
+            method = "Wind Chill + Apparent Temp (cold)"
+        else:
+            at = self.apparent_temperature(T, rh, wind_speed_ms, solar_radiation)
+            feels = at
+            method = "Apparent Temperature"
+        return {
+            'feels': feels,
+            'heat_index': self.heat_index(T, rh),
+            'wind_chill': self.wind_chill(T, wind_speed_kmh),
+            'apparent': self.apparent_temperature(T, rh, wind_speed_ms, solar_radiation),
+            'humidex': self.humidex(T, T_dew),
+            'T_dew': T_dew,
+            'wind_speed': wind_speed_kmh,
+            'solar_radiation': solar_radiation,
+            'method': method
+        }
+
+    def condensation_amount(self, V_dot, T_in, rh_in, T_surface):
+        T_dew = self.dew_point_from_T_rh(T_in, rh_in)
+        if T_dew is None or T_surface >= T_dew:
+            return 0, T_dew, False
+        p_v_in = (rh_in / 100.0) * self.p_sat(T_in)
+        x_in = self.x_from_pv(p_v_in)
+        rho_in = self.density(T_in, x_in)
+        m_dot_air = rho_in * V_dot
+        p_v_surf = self.p_sat(T_surface)
+        x_surf = self.x_from_pv(p_v_surf)
+        m_dot_condens = m_dot_air * (x_in - x_surf)
+        if m_dot_condens < 0:
+            m_dot_condens = 0
+        return m_dot_condens, T_dew, True
+
+    def all_quantities(self, T, rh, V_dot=300, wind_speed=5, solar=0):
+        p_v = (rh / 100.0) * self.p_sat(T)
+        x = self.x_from_pv(p_v)
+        h = self.enthalpy(T, x)
+        T_d = self.dew_point(p_v)
+        T_wb = self.wet_bulb_temperature(T, rh)
+        rho = self.density(T, x)
+        m_dot_air = rho * V_dot
+        m_dot_water = m_dot_air * x
+        feels_indoor = self.feels_like_indoor(T, rh)
+        feels_outdoor = self.feels_like_outdoor(T, rh, wind_speed, solar)
+        return {
+            'T': T, 'rh': rh, 'p_v': p_v, 'x': x, 'h': h,
+            'T_dew': T_d, 'T_wb': T_wb, 'rho': rho,
+            'V_dot': V_dot, 'm_dot_air': m_dot_air, 'm_dot_water': m_dot_water,
+            'feels_indoor': feels_indoor, 'feels_outdoor': feels_outdoor
+        }
+
+
+# ============================================================
+# DHT22 / ARDUINO SERIAL READER
+# ============================================================
+class DHT22Reader:
+    """Reads DHT22 over serial. Can also send commands to the Arduino."""
+
+    def __init__(self):
+        self.serial_conn = None
+        self.running = False
+        self.thread = None
+        self.callback = None
+
+    @staticmethod
+    def list_ports():
+        if not SERIAL_AVAILABLE:
+            return []
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    def connect(self, port, baudrate=9600):
+        if not SERIAL_AVAILABLE:
+            raise Exception("pyserial is not installed")
+        self.serial_conn = serial.Serial(port, baudrate, timeout=1)
+        time.sleep(2)
+        return True
+
+    def disconnect(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+        self.serial_conn = None
+
+    def start_reading(self, callback):
+        if not self.serial_conn:
+            raise Exception("No serial connection")
+        self.callback = callback
+        self.running = True
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+
+    def _read_loop(self):
+        while self.running:
+            try:
+                if self.serial_conn.in_waiting > 0:
+                    line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        parts = line.replace(';', ',').split(',')
+                        if len(parts) >= 2:
+                            try:
+                                T = float(parts[0])
+                                rh = float(parts[1])
+                                if self.callback:
+                                    self.callback(T, rh)
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    def send_command(self, cmd):
+        """Send a command line to the Arduino."""
+        if not self.serial_conn or not self.serial_conn.is_open:
+            return False
+        try:
+            if not cmd.endswith('\n'):
+                cmd += '\n'
+            self.serial_conn.write(cmd.encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Send error: {e}")
+            return False
+
+
+# ============================================================
+# FLOOR COOLING CONTROLLER
+# ============================================================
+class FloorCoolingController:
+    """
+    Controls floor cooling based on delta T and dew point protection.
+
+    - If T_indoor - T_outdoor < 2.0 C  -> floor cooling ON
+    - Supply temperature = indoor dew point + margin - 2.0 C, min 5 C
+    """
+
+    def __init__(self, psych):
+        self.psych = psych
+        self.on = False
+        self.safety_margin = 1.5
+        self.delta_t_threshold = 2.0
+        self.supply_temp = None
+        self.reason = ""
+
+    def calculate(self, T_indoor, rh_indoor, T_outdoor, rh_outdoor):
+        T_dew_indoor = self.psych.dew_point_from_T_rh(T_indoor, rh_indoor)
+        if T_dew_indoor is None:
+            return {'on': False, 'supply_temp': None,
+                    'dew_point_indoor': None, 'delta_t': None,
+                    'reason': 'Dew point could not be calculated',
+                    'warning': None}
+
+        delta_t = T_indoor - T_outdoor
+        T_floor_min = T_dew_indoor + self.safety_margin
+        T_supply = T_floor_min - 2.0
+
+        warning = None
+        if T_supply < 5.0:
+            T_supply = 5.0
+            warning = ("Supply temperature limited to 5 C "
+                       "(frost protection / COP protection)")
+
+        if delta_t < self.delta_t_threshold:
+            self.on = True
+            self.supply_temp = T_supply
+            self.reason = (f"Delta T = {delta_t:.2f} C < {self.delta_t_threshold} C "
+                           f"-> passive cooling insufficient, floor cooling ON")
+        else:
+            self.on = False
+            self.supply_temp = None
+            self.reason = (f"Delta T = {delta_t:.2f} C >= {self.delta_t_threshold} C "
+                           f"-> night ventilation sufficient, floor cooling OFF")
+
+        return {
+            'on': self.on,
+            'supply_temp': self.supply_temp,
+            'dew_point_indoor': T_dew_indoor,
+            'floor_min': T_floor_min,
+            'delta_t': delta_t,
+            'reason': self.reason,
+            'warning': warning
+        }
+
+    def send_to_arduino(self, ser, result):
+        if ser is None or not ser.is_open:
+            return False
+        try:
+            if result['on'] and result['supply_temp'] is not None:
+                cmd = f"C,1,{result['supply_temp']:.1f}\n"
+            else:
+                cmd = "C,0,0\n"
+            ser.write(cmd.encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Error sending to Arduino: {e}")
+            return False
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
+class MollierApp:
+    """Full app: indoor/outdoor climate, feels-like temperature,
+    condensation, DHT22, floor cooling control."""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Mollier - Indoor/Outdoor Climate & Feels-Like Temperature")
+        self.root.geometry("1600x1000")
+        self.root.resizable(True, True)
+
+        self.psych = Psychrometrics()
+        self.dht_indoor = DHT22Reader()
+        self.dht_outdoor = DHT22Reader()
+        self.dht_indoor_connected = False
+        self.dht_outdoor_connected = False
+
+        self.floor_cooling = FloorCoolingController(self.psych)
+        self.arduino_ser = None
+        self.floor_cooling_result = None
+
+        self.colors = {
+            'bg': '#0a0a1a', 'bg2': '#1a1a2e',
+            'frame_in': '#1e3a5f', 'frame_out': '#2d4a3e',
+            'accent2': '#00d2ff', 'accent3': '#ffd700',
+            'accent5': '#ff6b6b', 'text': '#ffffff', 'text2': '#b0b0b0',
+            'button': '#e94560', 'button_text': 'white',
+            'arduino': '#00979D'
+        }
+
+        self.root.configure(bg=self.colors['bg'])
+        self.V_dot_default = 300
+        self.create_widgets()
+        self.show_values()
+
+    # --------------------------------------------------------
+    def create_widgets(self):
+        main_frame = tk.Frame(self.root, bg=self.colors['bg'])
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Title
+        title_frame = tk.Frame(main_frame, bg=self.colors['bg2'], height=70)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+        title_frame.pack_propagate(False)
+
+        tk.Label(title_frame, text="INDOOR vs OUTDOOR CLIMATE - FEELS-LIKE TEMPERATURE",
+                 font=('Arial', 18, 'bold'), bg=self.colors['bg2'],
+                 fg=self.colors['accent3']).pack(expand=True)
+        tk.Label(title_frame,
+                 text="Indoor climate constant | Outdoor climate with wind, sun and feels-like | DHT22 + floor cooling",
+                 font=('Arial', 10), bg=self.colors['bg2'],
+                 fg=self.colors['accent2']).pack()
+
+        # Panels
+        left_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        center_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        center_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        right_panel = tk.Frame(main_frame, bg=self.colors['bg'])
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # ====================================================
+        # INDOOR SENSOR
+        # ====================================================
+        indoor_frame = tk.Frame(left_panel, bg=self.colors['frame_in'], relief=tk.RAISED, bd=2)
+        indoor_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(indoor_frame, text="INDOOR CLIMATE",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_in'],
+                 fg='#00ff88').pack(pady=(8, 3))
+
+        port_in_frame = tk.Frame(indoor_frame, bg=self.colors['frame_in'])
+        port_in_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(port_in_frame, text="Port:", font=('Arial', 9),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+        self.port_in_var = tk.StringVar()
+        self.port_in_combo = ttk.Combobox(port_in_frame, textvariable=self.port_in_var,
+                                          values=DHT22Reader.list_ports(), width=12)
+        self.port_in_combo.pack(side=tk.LEFT, padx=5)
+        tk.Button(port_in_frame, text="R", font=('Arial', 9), bg='#006064',
+                  fg='white', command=self.refresh_ports).pack(side=tk.LEFT, padx=2)
+
+        self.connect_in_btn = tk.Button(indoor_frame, text="CONNECT INDOOR",
+                                        font=('Arial', 10, 'bold'),
+                                        bg='#00695C', fg='white',
+                                        command=lambda: self.toggle_connection('indoor'))
+        self.connect_in_btn.pack(pady=4)
+
+        self.status_in_var = tk.StringVar(value="Indoor not connected")
+        tk.Label(indoor_frame, textvariable=self.status_in_var,
+                 font=('Arial', 9), bg=self.colors['frame_in'],
+                 fg='#FFD54F').pack()
+
+        live_in = tk.Frame(indoor_frame, bg=self.colors['frame_in'])
+        live_in.pack(fill=tk.X, padx=15, pady=8)
+
+        tk.Label(live_in, text="T:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+        self.dht_in_temp = tk.StringVar(value="--.-")
+        tk.Label(live_in, textvariable=self.dht_in_temp, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#00ff88', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_in, text="C", font=('Arial', 10),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+
+        tk.Label(live_in, text="RH:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT, padx=(10, 0))
+        self.dht_in_rh = tk.StringVar(value="--")
+        tk.Label(live_in, textvariable=self.dht_in_rh, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#00ff88', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_in, text="%", font=('Arial', 10),
+                 bg=self.colors['frame_in'], fg='white').pack(side=tk.LEFT)
+
+        # ====================================================
+        # OUTDOOR SENSOR
+        # ====================================================
+        outdoor_frame = tk.Frame(left_panel, bg=self.colors['frame_out'], relief=tk.RAISED, bd=2)
+        outdoor_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(outdoor_frame, text="OUTDOOR CLIMATE",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_out'],
+                 fg='#FFD54F').pack(pady=(8, 3))
+
+        port_out_frame = tk.Frame(outdoor_frame, bg=self.colors['frame_out'])
+        port_out_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(port_out_frame, text="Port:", font=('Arial', 9),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+        self.port_out_var = tk.StringVar()
+        self.port_out_combo = ttk.Combobox(port_out_frame, textvariable=self.port_out_var,
+                                           values=DHT22Reader.list_ports(), width=12)
+        self.port_out_combo.pack(side=tk.LEFT, padx=5)
+        tk.Button(port_out_frame, text="R", font=('Arial', 9), bg='#006064',
+                  fg='white', command=self.refresh_ports).pack(side=tk.LEFT, padx=2)
+
+        self.connect_out_btn = tk.Button(outdoor_frame, text="CONNECT OUTDOOR",
+                                         font=('Arial', 10, 'bold'),
+                                         bg='#00695C', fg='white',
+                                         command=lambda: self.toggle_connection('outdoor'))
+        self.connect_out_btn.pack(pady=4)
+
+        self.status_out_var = tk.StringVar(value="Outdoor not connected")
+        tk.Label(outdoor_frame, textvariable=self.status_out_var,
+                 font=('Arial', 9), bg=self.colors['frame_out'],
+                 fg='#FFD54F').pack()
+
+        live_out = tk.Frame(outdoor_frame, bg=self.colors['frame_out'])
+        live_out.pack(fill=tk.X, padx=15, pady=8)
+
+        tk.Label(live_out, text="T:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+        self.dht_out_temp = tk.StringVar(value="--.-")
+        tk.Label(live_out, textvariable=self.dht_out_temp, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#FFD54F', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_out, text="C", font=('Arial', 10),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+
+        tk.Label(live_out, text="RH:", font=('Arial', 11, 'bold'),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT, padx=(10, 0))
+        self.dht_out_rh = tk.StringVar(value="--")
+        tk.Label(live_out, textvariable=self.dht_out_rh, font=('Arial', 12, 'bold'),
+                 bg='#006064', fg='#FFD54F', width=7).pack(side=tk.LEFT, padx=3)
+        tk.Label(live_out, text="%", font=('Arial', 10),
+                 bg=self.colors['frame_out'], fg='white').pack(side=tk.LEFT)
+
+        # ====================================================
+        # PARAMETERS
+        # ====================================================
+        input_frame = tk.Frame(left_panel, bg=self.colors['bg2'], relief=tk.RAISED, bd=2)
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(input_frame, text="PARAMETERS",
+                 font=('Arial', 11, 'bold'), bg=self.colors['bg2'],
+                 fg=self.colors['accent2']).pack(pady=(8, 5))
+
+        # Indoor
+        tk.Label(input_frame, text="INDOOR:", font=('Arial', 10, 'bold'),
+                 bg=self.colors['bg2'], fg='#00ff88').pack(pady=(5, 2))
+
+        row_in = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_in.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row_in, text="T:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.temp_in_var = tk.StringVar(value="22")
+        tk.Entry(row_in, textvariable=self.temp_in_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_in, text="C   RH:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.rh_in_var = tk.StringVar(value="50")
+        tk.Entry(row_in, textvariable=self.rh_in_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_in, text="%", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Outdoor
+        tk.Label(input_frame, text="OUTDOOR:", font=('Arial', 10, 'bold'),
+                 bg=self.colors['bg2'], fg='#FFD54F').pack(pady=(8, 2))
+
+        row_out = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_out.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row_out, text="T:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.temp_out_var = tk.StringVar(value="15")
+        tk.Entry(row_out, textvariable=self.temp_out_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_out, text="C   RH:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.rh_out_var = tk.StringVar(value="70")
+        tk.Entry(row_out, textvariable=self.rh_out_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_out, text="%", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Wind and sun
+        row_weather = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_weather.pack(fill=tk.X, padx=20, pady=5)
+        tk.Label(row_weather, text="Wind:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.wind_var = tk.StringVar(value="10")
+        tk.Entry(row_weather, textvariable=self.wind_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_weather, text="km/h   Sun:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.solar_var = tk.StringVar(value="0")
+        tk.Entry(row_weather, textvariable=self.solar_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_weather, text="W/m2", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        # Flow and surface
+        row_flow = tk.Frame(input_frame, bg=self.colors['bg2'])
+        row_flow.pack(fill=tk.X, padx=20, pady=5)
+        tk.Label(row_flow, text="Flow:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.flow_var = tk.StringVar(value="300")
+        tk.Entry(row_flow, textvariable=self.flow_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_flow, text="m3/h   Surface:", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+        self.surf_var = tk.StringVar(value="10")
+        tk.Entry(row_flow, textvariable=self.surf_var, width=6,
+                 font=('Arial', 9), bg='#2d2d44', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(row_flow, text="C", font=('Arial', 9),
+                 bg=self.colors['bg2'], fg='white').pack(side=tk.LEFT)
+
+        tk.Button(input_frame, text="CALCULATE ALL",
+                  font=('Arial', 12, 'bold'), bg=self.colors['button'],
+                  fg='white', relief=tk.RAISED, bd=3,
+                  command=self.show_values).pack(pady=10)
+
+        # ====================================================
+        # FLOOR COOLING CONTROL
+        # ====================================================
+        fc_frame = tk.Frame(input_frame, bg='#2a1a3a', relief=tk.RAISED, bd=2)
+        fc_frame.pack(fill=tk.X, padx=5, pady=(5, 10))
+
+        tk.Label(fc_frame, text="FLOOR COOLING CONTROL",
+                 font=('Arial', 10, 'bold'), bg='#2a1a3a',
+                 fg='#00d2ff').pack(pady=(6, 3))
+
+        # Mode
+        mode_frame = tk.Frame(fc_frame, bg='#2a1a3a')
+        mode_frame.pack(fill=tk.X, padx=10, pady=3)
+
+        self.control_mode = tk.StringVar(value="manual")
+        tk.Radiobutton(mode_frame, text="Manual", variable=self.control_mode,
+                       value="manual", bg='#2a1a3a', fg='white',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       command=self.update_control_mode).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(mode_frame, text="Arduino", variable=self.control_mode,
+                       value="arduino", bg='#2a1a3a', fg='white',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       command=self.update_control_mode).pack(side=tk.LEFT, padx=5)
+
+        # Status
+        self.fc_status_var = tk.StringVar(value="Not yet calculated")
+        self.fc_status_label = tk.Label(fc_frame, textvariable=self.fc_status_var,
+                                        font=('Arial', 10, 'bold'),
+                                        bg='#2a1a3a', fg='#888',
+                                        wraplength=350, justify=tk.LEFT)
+        self.fc_status_label.pack(pady=5, padx=10)
+
+        self.fc_detail_var = tk.StringVar(value="")
+        tk.Label(fc_frame, textvariable=self.fc_detail_var,
+                 font=('Arial', 8), bg='#2a1a3a', fg='#b0b0b0',
+                 wraplength=350, justify=tk.LEFT).pack(pady=(0, 8), padx=10)
+
+        # Arduino port
+        arduino_row = tk.Frame(fc_frame, bg='#2a1a3a')
+        arduino_row.pack(fill=tk.X, padx=10, pady=3)
+        tk.Label(arduino_row, text="Arduino port:", font=('Arial', 8),
+                 bg='#2a1a3a', fg='white').pack(side=tk.LEFT)
+        self.arduino_port_var = tk.StringVar()
+        self.arduino_port_combo = ttk.Combobox(arduino_row,
+                                               textvariable=self.arduino_port_var,
+                                               values=DHT22Reader.list_ports(),
+                                               width=12)
+        self.arduino_port_combo.pack(side=tk.LEFT, padx=5)
+
+        self.arduino_connect_btn = tk.Button(arduino_row, text="Connect",
+                                             font=('Arial', 8, 'bold'),
+                                             bg='#00695C', fg='white',
+                                             command=self.toggle_arduino)
+        self.arduino_connect_btn.pack(side=tk.LEFT, padx=3)
+
+        # Override
+        override_row = tk.Frame(fc_frame, bg='#2a1a3a')
+        override_row.pack(fill=tk.X, padx=10, pady=3)
+        self.override_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(override_row, text="Force floor cooling ON",
+                       variable=self.override_var, bg='#2a1a3a', fg='#ff6b6b',
+                       selectcolor='#2a1a3a', activebackground='#2a1a3a',
+                       font=('Arial', 8),
+                       command=self.show_values).pack(side=tk.LEFT)
+
+        # Save Arduino sketch
+        tk.Button(fc_frame, text="Save sketch as .ino",
+                  font=('Arial', 8), bg='#00979D', fg='white',
+                  command=self.save_arduino_sketch).pack(pady=(0, 6))
+
+        # ====================================================
+        # CENTER — RESULTS
+        # ====================================================
+        result_frame = tk.Frame(center_panel, bg=self.colors['frame_in'],
+                                relief=tk.RAISED, bd=2)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(result_frame, text="INDOOR vs OUTDOOR COMPARISON",
+                 font=('Arial', 11, 'bold'), bg=self.colors['frame_in'],
+                 fg=self.colors['accent2']).pack(pady=(10, 5))
+
+        columns = ('Quantity', 'Indoor', 'Outdoor', 'Unit')
+        self.result_tree = ttk.Treeview(result_frame, columns=columns,
+                                        show='headings', height=24)
+
+        self.result_tree.heading('Quantity', text='Quantity')
+        self.result_tree.heading('Indoor', text='Indoor')
+        self.result_tree.heading('Outdoor', text='Outdoor')
+        self.result_tree.heading('Unit', text='Unit')
+
+        self.result_tree.column('Quantity', width=200, anchor='w')
+        self.result_tree.column('Indoor', width=100, anchor='e')
+        self.result_tree.column('Outdoor', width=100, anchor='e')
+        self.result_tree.column('Unit', width=80, anchor='w')
+
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
+                                  command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                              padx=(10, 0), pady=10)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
+
+        # ====================================================
+        # RIGHT — FEELS-LIKE + CHART
+        # ====================================================
+        tk.Label(right_panel, text="FEELS-LIKE TEMPERATURE ANALYSIS",
+                 font=('Arial', 11, 'bold'), bg=self.colors['bg'],
+                 fg=self.colors['accent2']).pack(pady=(0, 10))
+
+        self.canvas = tk.Canvas(right_panel, bg='#0a0a1a', relief=tk.SUNKEN,
+                                bd=2, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        indoor_info = tk.Frame(right_panel, bg='#1a3a2e', relief=tk.RAISED, bd=2)
+        indoor_info.pack(fill=tk.X, pady=(0, 5))
+
+        tk.Label(indoor_info, text="INDOOR FEELS-LIKE TEMPERATURE",
+                 font=('Arial', 10, 'bold'), bg='#1a3a2e',
+                 fg='#00ff88').pack(pady=(5, 2))
+
+        self.indoor_status = tk.Label(indoor_info, text="", font=('Arial', 9),
+                                      bg='#1a3a2e', fg=self.colors['text2'],
+                                      wraplength=380, justify=tk.LEFT)
+        self.indoor_status.pack(pady=(0, 8), padx=10)
+
+        outdoor_info = tk.Frame(right_panel, bg='#3a2e1a', relief=tk.RAISED, bd=2)
+        outdoor_info.pack(fill=tk.X, pady=(0, 5))
+
+        tk.Label(outdoor_info, text="OUTDOOR FEELS-LIKE TEMPERATURE",
+                 font=('Arial', 10, 'bold'), bg='#3a2e1a',
+                 fg='#FFD54F').pack(pady=(5, 2))
+
+        self.outdoor_status = tk.Label(outdoor_info, text="", font=('Arial', 9),
+                                       bg='#3a2e1a', fg=self.colors['text2'],
+                                       wraplength=380, justify=tk.LEFT)
+        self.outdoor_status.pack(pady=(0, 8), padx=10)
+
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready for analysis...")
+        tk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN,
+                 anchor=tk.W, font=('Arial', 9), bg=self.colors['bg2'],
+                 fg=self.colors['text2']).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Traces
+        for var in [self.temp_in_var, self.rh_in_var, self.temp_out_var,
+                    self.rh_out_var, self.wind_var, self.solar_var,
+                    self.flow_var, self.surf_var]:
+            var.trace_add('write', lambda *args: self.show_values())
+
+    # --------------------------------------------------------
+    # DHT22 / Arduino functions
+    # --------------------------------------------------------
+    def refresh_ports(self):
+        if not SERIAL_AVAILABLE:
+            messagebox.showwarning("pyserial not found",
+                                   "Install pyserial:\n\npip install pyserial")
+            return
+        ports = DHT22Reader.list_ports()
+        self.port_in_combo['values'] = ports
+        self.port_out_combo['values'] = ports
+        self.arduino_port_combo['values'] = ports
+        if len(ports) >= 1 and not self.port_in_var.get():
+            self.port_in_var.set(ports[0])
+        if len(ports) >= 2 and not self.port_out_var.get():
+            self.port_out_var.set(ports[1])
+        if len(ports) >= 1 and not self.arduino_port_var.get():
+            self.arduino_port_var.set(ports[0])
+        self.status_var.set(f"{len(ports)} port(s) found")
+
+    def toggle_connection(self, location):
+        if location == 'indoor':
+            if self.dht_indoor_connected:
+                self.dht_indoor.disconnect()
+                self.dht_indoor_connected = False
+                self.connect_in_btn.config(text="CONNECT INDOOR", bg='#00695C')
+                self.status_in_var.set("Indoor not connected")
+            else:
+                self._connect(location)
+        else:
+            if self.dht_outdoor_connected:
+                self.dht_outdoor.disconnect()
+                self.dht_outdoor_connected = False
+                self.connect_out_btn.config(text="CONNECT OUTDOOR", bg='#00695C')
+                self.status_out_var.set("Outdoor not connected")
+            else:
+                self._connect(location)
+
+    def _connect(self, location):
+        if not SERIAL_AVAILABLE:
+            messagebox.showerror("Error", "pyserial is not installed.\n\npip install pyserial")
+            return
+        port = self.port_in_var.get() if location == 'indoor' else self.port_out_var.get()
+        if not port:
+            messagebox.showwarning("No port", f"Select a port for {location}.")
+            return
+        try:
+            if location == 'indoor':
+                self.dht_indoor.connect(port)
+                self.dht_indoor_connected = True
+                self.connect_in_btn.config(text="DISCONNECT INDOOR", bg='#c62828')
+                self.status_in_var.set(f"Indoor: {port}")
+                self.dht_indoor.start_reading(self.on_dht_indoor)
+            else:
+                self.dht_outdoor.connect(port)
+                self.dht_outdoor_connected = True
+                self.connect_out_btn.config(text="DISCONNECT OUTDOOR", bg='#c62828')
+                self.status_out_var.set(f"Outdoor: {port}")
+                self.dht_outdoor.start_reading(self.on_dht_outdoor)
+            self.status_var.set(f"{location.capitalize()} connected on {port}")
+        except Exception as e:
+            messagebox.showerror("Connection error", f"Could not connect:\n{str(e)}")
+
+    def on_dht_indoor(self, T, rh):
+        self.root.after(0, lambda: self._update_dht_indoor(T, rh))
+
+    def on_dht_outdoor(self, T, rh):
+        self.root.after(0, lambda: self._update_dht_outdoor(T, rh))
+
+    def _update_dht_indoor(self, T, rh):
+        self.dht_in_temp.set(f"{T:.1f}")
+        self.dht_in_rh.set(f"{rh:.0f}")
+        if self.control_mode.get() == 'arduino':
+            self.temp_in_var.set(f"{T:.1f}")
+            self.rh_in_var.set(f"{rh:.0f}")
+
+    def _update_dht_outdoor(self, T, rh):
+        self.dht_out_temp.set(f"{T:.1f}")
+        self.dht_out_rh.set(f"{rh:.0f}")
+        if self.control_mode.get() == 'arduino':
+            self.temp_out_var.set(f"{T:.1f}")
+            self.rh_out_var.set(f"{rh:.0f}")
+
+    # --------------------------------------------------------
+    # Floor cooling
+    # --------------------------------------------------------
+    def update_control_mode(self):
+        mode = self.control_mode.get()
+        if mode == 'manual':
+            if self.arduino_ser and self.arduino_ser.is_open:
+                self.arduino_ser.close()
+            self.arduino_ser = None
+            self.arduino_connect_btn.config(text="Connect", bg='#00695C')
+            self.status_var.set("Manual mode: entered values are used for calculation")
+        else:
+            self.status_var.set("Arduino mode: sensor values come from Arduino")
+        self.show_values()
+
+    def toggle_arduino(self):
+        if self.arduino_ser and self.arduino_ser.is_open:
+            self.arduino_ser.close()
+            self.arduino_ser = None
+            self.arduino_connect_btn.config(text="Connect", bg='#00695C')
+            self.status_var.set("Arduino control disconnected")
+            return
+        if not SERIAL_AVAILABLE:
+            messagebox.showerror("Error", "pyserial is not installed")
+            return
+        port = self.arduino_port_var.get()
+        if not port:
+            messagebox.showwarning("No port", "Select an Arduino port.")
+            return
+        try:
+            self.arduino_ser = serial.Serial(port, 9600, timeout=1)
+            time.sleep(2)
+            self.arduino_connect_btn.config(text="Disconnect", bg='#c62828')
+            self.status_var.set(f"Arduino control connected on {port}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not connect to Arduino:\n{e}")
+
+    def update_floor_cooling(self, T_in, rh_in, T_out, rh_out):
+        result = self.floor_cooling.calculate(T_in, rh_in, T_out, rh_out)
+        self.floor_cooling_result = result
+
+        if self.override_var.get():
+            result['on'] = True
+            if result['supply_temp'] is None:
+                T_dew = result.get('dew_point_indoor')
+                result['supply_temp'] = (T_dew + 1.5 - 2.0) if T_dew else 12.0
+            result['reason'] = "MANUALLY FORCED ON"
+
+        if result['on']:
+            self.fc_status_var.set(
+                f"FLOOR COOLING ON\n"
+                f"   Supply temperature: {result['supply_temp']:.1f} C"
+            )
+            self.fc_status_label.config(fg='#00ff88')
+        else:
+            self.fc_status_var.set("FLOOR COOLING OFF")
+            self.fc_status_label.config(fg='#ff6b6b')
+
+        detail = result['reason']
+        if result.get('dew_point_indoor') is not None:
+            detail += f"\nIndoor dew point: {result['dew_point_indoor']:.1f} C"
+        if 'floor_min' in result:
+            detail += f"\nMin. floor temperature: {result['floor_min']:.1f} C"
+        if result.get('warning'):
+            detail += f"\n{result['warning']}"
+        self.fc_detail_var.set(detail)
+
+        if (self.control_mode.get() == 'arduino'
+                and self.arduino_ser and self.arduino_ser.is_open):
+            self.floor_cooling.send_to_arduino(self.arduino_ser, result)
+
+    def save_arduino_sketch(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".ino",
+            filetypes=[("Arduino sketch", "*.ino"), ("All files", "*.*")],
+            initialfile="vloerkoeling.ino"
+        )
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(ARDUINO_SKETCH)
+                messagebox.showinfo("Saved",
+                                    f"Arduino sketch saved:\n{path}\n\n"
+                                    f"Open this file in the Arduino IDE.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not save:\n{e}")
+
+    # --------------------------------------------------------
+    # Calculations
+    # --------------------------------------------------------
+    def show_values(self):
+        try:
+            T_in = float(self.temp_in_var.get())
+            rh_in = float(self.rh_in_var.get())
+            T_out = float(self.temp_out_var.get())
+            rh_out = float(self.rh_out_var.get())
+            wind = float(self.wind_var.get())
+            solar = float(self.solar_var.get())
+            V_dot = float(self.flow_var.get())
+            T_surf = float(self.surf_var.get())
+
+            res_in = self.psych.all_quantities(T_in, rh_in, V_dot, 0, 0)
+            res_out = self.psych.all_quantities(T_out, rh_out, V_dot, wind, solar)
+
+            m_cond_in, T_d_in, has_in = self.psych.condensation_amount(
+                V_dot, T_in, rh_in, T_surf)
+            m_cond_out, T_d_out, has_out = self.psych.condensation_amount(
+                V_dot, T_out, rh_out, T_surf)
+
+            self.result_tree.delete(*self.result_tree.get_children())
+
+            self.update_floor_cooling(T_in, rh_in, T_out, rh_out)
+            fc = self.floor_cooling_result
+
+            rows = [
+                ('--- BASIC PARAMETERS ---', '', '', ''),
+                ('Temperature', f"{T_in:.1f}", f"{T_out:.1f}", 'C'),
+                ('Relative humidity', f"{rh_in:.0f}", f"{rh_out:.0f}", '%'),
+                ('Absolute humidity', f"{res_in['x']:.4f}", f"{res_out['x']:.4f}", 'kg/kg'),
+                ('Density', f"{res_in['rho']:.3f}", f"{res_out['rho']:.3f}", 'kg/m3'),
+                ('', '', '', ''),
+                ('--- PSYCHROMETRIC ---', '', '', ''),
+                ('Dew point',
+                 f"{res_in['T_dew']:.1f}" if res_in['T_dew'] else '--',
+                 f"{res_out['T_dew']:.1f}" if res_out['T_dew'] else '--', 'C'),
+                ('Wet-bulb temperature', f"{res_in['T_wb']:.1f}",
+                 f"{res_out['T_wb']:.1f}", 'C'),
+                ('Enthalpy', f"{res_in['h']:.1f}", f"{res_out['h']:.1f}", 'kJ/kg'),
+                ('Water flow', f"{res_in['m_dot_water']:.3f}",
+                 f"{res_out['m_dot_water']:.3f}", 'kg/h'),
+                ('', '', '', ''),
+                ('--- FEELS-LIKE TEMPERATURE ---', '', '', ''),
+                ('Feels-like temperature',
+                 f"{res_in['feels_indoor']['feels']:.1f}",
+                 f"{res_out['feels_outdoor']['feels']:.1f}", 'C'),
+                ('Humidex',
+                 f"{res_in['feels_indoor']['humidex']:.1f}",
+                 f"{res_out['feels_outdoor']['humidex']:.1f}", 'C'),
+                ('Apparent Temp',
+                 f"{res_in['feels_indoor']['apparent']:.1f}",
+                 f"{res_out['feels_outdoor']['apparent']:.1f}", 'C'),
+                ('Heat Index', '--',
+                 f"{res_out['feels_outdoor']['heat_index']:.1f}", 'C'),
+                ('Wind Chill', '--',
+                 f"{res_out['feels_outdoor']['wind_chill']:.1f}", 'C'),
+                ('Method', res_in['feels_indoor']['method'][:20],
+                 res_out['feels_outdoor']['method'][:20], ''),
+                ('', '', '', ''),
+                ('--- CONDENSATION ---', '', '', ''),
+                ('Condensation', f"{m_cond_in:.3f}", f"{m_cond_out:.3f}", 'kg/h'),
+                ('Condensation/day', f"{m_cond_in * 24:.2f}",
+                 f"{m_cond_out * 24:.2f}", 'kg/day'),
+                ('Status', 'YES' if has_in else 'NO',
+                 'YES' if has_out else 'NO', ''),
+                ('', '', '', ''),
+                ('--- FLOOR COOLING ---', '', '', ''),
+                ('Delta T (indoor-outdoor)', f"{T_in - T_out:+.2f}", '', 'C'),
+                ('Floor cooling',
+                 'ON' if (fc and fc['on']) else 'OFF', '', ''),
+                ('Supply temperature',
+                 f"{fc['supply_temp']:.1f}"
+                 if (fc and fc.get('supply_temp')) else '--', '', 'C'),
+                ('Indoor dew point',
+                 f"{fc['dew_point_indoor']:.1f}"
+                 if (fc and fc.get('dew_point_indoor')) else '--', '', 'C'),
+            ]
+
+            for row in rows:
+                item = self.result_tree.insert('', tk.END, values=row)
+                if '---' in row[0]:
+                    self.result_tree.tag_configure('header',
+                                                   background='#2d1b4e',
+                                                   foreground='#ffd700')
+                    self.result_tree.item(item, tags=('header',))
+                elif 'FEELS-LIKE' in row[0]:
+                    self.result_tree.tag_configure('feels',
+                                                   background='#1f3d2f',
+                                                   foreground='#00ff88')
+                    self.result_tree.item(item, tags=('feels',))
+                elif 'FLOOR COOLING' in row[0] or 'Supply' in row[0]:
+                    self.result_tree.tag_configure('fc',
+                                                   background='#2a1a3a',
+                                                   foreground='#00d2ff')
+                    self.result_tree.item(item, tags=('fc',))
+
+            self.update_indoor_info(res_in, T_in, rh_in)
+            self.update_outdoor_info(res_out, T_out, rh_out, wind, solar)
+
+            self.status_var.set(
+                f"Indoor: {T_in:.1f} C (feels "
+                f"{res_in['feels_indoor']['feels']:.1f} C) | "
+                f"Outdoor: {T_out:.1f} C (feels "
+                f"{res_out['feels_outdoor']['feels']:.1f} C) | "
+                f"Delta T = {T_in - T_out:+.2f} C"
+            )
+
+            self.draw_chart(res_in, res_out, T_in, T_out, rh_in, rh_out)
+
+        except ValueError as e:
+            messagebox.showerror("Error", f"Please enter valid numeric values.\n{str(e)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error: {str(e)}")
+
+    def update_indoor_info(self, res, T, rh):
+        f = res['feels_indoor']
+        lines = [
+            f"Temperature: {T:.1f} C",
+            f"Humidity: {rh:.0f}%",
+            f"Dew point: {f['T_dew']:.1f} C",
+            "",
+            f"FEELS-LIKE TEMPERATURE: {f['feels']:.1f} C",
+            f"   Humidex: {f['humidex']:.1f} C",
+            f"   Apparent Temp: {f['apparent']:.1f} C",
+            f"   Method: {f['method']}",
+            "",
+            "Indoor climate is constant:",
+        ]
+        if T < 18:
+            lines.append("   Too cold - increase heating")
+        elif T > 26:
+            lines.append("   Too warm - increase ventilation")
+        elif 20 <= T <= 24 and 40 <= rh <= 60:
+            lines.append("   Comfortable indoor climate")
+        else:
+            lines.append("   Acceptable indoor climate")
+        self.indoor_status.config(text="\n".join(lines))
+
+    def update_outdoor_info(self, res, T, rh, wind, solar):
+        f = res['feels_outdoor']
+        lines = [
+            f"Temperature: {T:.1f} C",
+            f"Humidity: {rh:.0f}%",
+            f"Dew point: {f['T_dew']:.1f} C",
+            f"Wind: {wind:.0f} km/h",
+            f"Sun: {solar:.0f} W/m2",
+            "",
+            f"FEELS-LIKE TEMPERATURE: {f['feels']:.1f} C",
+            f"   Heat Index: {f['heat_index']:.1f} C",
+            f"   Wind Chill: {f['wind_chill']:.1f} C",
+            f"   Apparent Temp: {f['apparent']:.1f} C",
+            f"   Humidex: {f['humidex']:.1f} C",
+            f"   Method: {f['method']}",
+            "",
+        ]
+        diff = f['feels'] - T
+        if diff > 3:
+            lines.append(f"Feels {diff:.1f} C WARMER")
+            lines.append("   High humidity / little wind")
+        elif diff < -3:
+            lines.append(f"Feels {abs(diff):.1f} C COLDER")
+            lines.append("   Wind chill effect / little sun")
+        else:
+            lines.append("Feels about the same")
+        self.outdoor_status.config(text="\n".join(lines))
+
+    def draw_chart(self, res_in, res_out, T_in, T_out, rh_in, rh_out):
+        self.canvas.delete("all")
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width < 10 or height < 10:
+            return
+
+        margin = 60
+        plot_width = width - 2 * margin
+        plot_height = height - 2 * margin
+
+        self.canvas.create_rectangle(0, 0, width, height, fill='#0a0a1a')
+        self.canvas.create_line(margin, margin, margin, height - margin,
+                                width=3, fill='#00d2ff')
+        self.canvas.create_line(margin, height - margin, width - margin,
+                                height - margin, width=3, fill='#00d2ff')
+
+        self.canvas.create_text(margin - 15, height // 2, text="h (kJ/kg)",
+                                angle=90, font=('Arial', 10, 'bold'),
+                                fill='#00d2ff')
+        self.canvas.create_text(width // 2, height - margin + 25,
+                                text="Moisture content x (kg/kg)",
+                                font=('Arial', 10, 'bold'), fill='#00d2ff')
+        self.canvas.create_text(width // 2, margin - 20,
+                                text="INDOOR vs OUTDOOR CLIMATE",
+                                font=('Arial', 12, 'bold'), fill='#ffd700')
+
+        x_max = 0.035
+        h_max = 120
+        x_scale = plot_width / x_max
+        h_scale = plot_height / h_max * 0.9
+
+        # Saturation line
+        for temp in range(-10, 51, 1):
+            try:
+                p_sat = self.psych.p_sat(temp)
+                x = self.psych.x_from_pv(p_sat)
+                h = self.psych.enthalpy(temp, x)
+                if 0 <= x <= x_max and 0 <= h <= h_max and temp > -10:
+                    p_sat_p = self.psych.p_sat(temp - 1)
+                    x_p = self.psych.x_from_pv(p_sat_p)
+                    h_p = self.psych.enthalpy(temp - 1, x_p)
+                    if 0 <= x_p <= x_max and 0 <= h_p <= h_max:
+                        px1 = margin + x_p * x_scale
+                        py1 = height - margin - h_p * h_scale
+                        px2 = margin + x * x_scale
+                        py2 = height - margin - h * h_scale
+                        self.canvas.create_line(px1, py1, px2, py2,
+                                                fill='#e94560', width=3)
+            except Exception:
+                continue
+
+        # RH lines
+        for rh_val in [20, 40, 60, 80]:
+            for temp in range(-10, 51, 2):
+                try:
+                    p_sat = self.psych.p_sat(temp)
+                    p_v = (rh_val / 100.0) * p_sat
+                    x = self.psych.x_from_pv(p_v)
+                    h = self.psych.enthalpy(temp, x)
+                    if 0 <= x <= x_max and 0 <= h <= h_max:
+                        p_sat_p = self.psych.p_sat(temp - 2)
+                        p_v_p = (rh_val / 100.0) * p_sat_p
+                        x_p = self.psych.x_from_pv(p_v_p)
+                        h_p = self.psych.enthalpy(temp - 2, x_p)
+                        if 0 <= x_p <= x_max and 0 <= h_p <= h_max:
+                            px1 = margin + x_p * x_scale
+                            py1 = height - margin - h_p * h_scale
+                            px2 = margin + x * x_scale
+                            py2 = height - margin - h * h_scale
+                            self.canvas.create_line(px1, py1, px2, py2,
+                                                    fill='#3498db', width=1,
+                                                    dash=(3, 3))
+                except Exception:
+                    continue
+
+        # Indoor point
+        if 0 <= res_in['x'] <= x_max and 0 <= res_in['h'] <= h_max:
+            px = margin + res_in['x'] * x_scale
+            py = height - margin - res_in['h'] * h_scale
+            self.canvas.create_oval(px - 10, py - 10, px + 10, py + 10,
+                                    fill='#00ff88', outline='white', width=2)
+            self.canvas.create_rectangle(px + 15, py - 40, px + 175, py + 10,
+                                         fill='#1a3a2e', outline='#00ff88')
+            self.canvas.create_text(
+                px + 20, py - 35,
+                text=f"INDOOR\n{res_in['T']:.1f} C, RH={res_in['rh']:.0f}%\n"
+                     f"Feels: {res_in['feels_indoor']['feels']:.1f} C",
+                anchor='w', font=('Arial', 8), fill='#00ff88')
+
+        # Outdoor point
+        if 0 <= res_out['x'] <= x_max and 0 <= res_out['h'] <= h_max:
+            px = margin + res_out['x'] * x_scale
+            py = height - margin - res_out['h'] * h_scale
+            self.canvas.create_oval(px - 10, py - 10, px + 10, py + 10,
+                                    fill='#FFD54F', outline='white', width=2)
+            self.canvas.create_rectangle(px + 15, py - 40, px + 185, py + 10,
+                                         fill='#3a2e1a', outline='#FFD54F')
+            self.canvas.create_text(
+                px + 20, py - 35,
+                text=f"OUTDOOR\n{res_out['T']:.1f} C, RH={res_out['rh']:.0f}%\n"
+                     f"Feels: {res_out['feels_outdoor']['feels']:.1f} C",
+                anchor='w', font=('Arial', 8), fill='#FFD54F')
+
+        # Connecting line
+        if (0 <= res_in['x'] <= x_max and 0 <= res_in['h'] <= h_max and
+                0 <= res_out['x'] <= x_max and 0 <= res_out['h'] <= h_max):
+            px1 = margin + res_in['x'] * x_scale
+            py1 = height - margin - res_in['h'] * h_scale
+            px2 = margin + res_out['x'] * x_scale
+            py2 = height - margin - res_out['h'] * h_scale
+            self.canvas.create_line(px1, py1, px2, py2, fill='#ff6bff',
+                                    width=2, dash=(6, 4))
+
+        # Legend
+        lx, ly = margin + 10, margin + 10
+        self.canvas.create_rectangle(lx, ly, lx + 200, ly + 80,
+                                     fill='#1a1a2e', outline='#00d2ff')
+        self.canvas.create_text(lx + 10, ly + 15, text="LEGEND", anchor='w',
+                                font=('Arial', 9, 'bold'), fill='#ffd700')
+
+        self.canvas.create_oval(lx + 10, ly + 28, lx + 25, ly + 43,
+                                fill='#00ff88', outline='white')
+        self.canvas.create_text(lx + 35, ly + 35, text="Indoor climate",
+                                anchor='w', font=('Arial', 8), fill='#00ff88')
+
+        self.canvas.create_oval(lx + 10, ly + 48, lx + 25, ly + 63,
+                                fill='#FFD54F', outline='white')
+        self.canvas.create_text(lx + 35, ly + 55, text="Outdoor climate",
+                                anchor='w', font=('Arial', 8), fill='#FFD54F')
+
+        self.canvas.create_line(lx + 10, ly + 73, lx + 25, ly + 73,
+                                fill='#ff6bff', width=2, dash=(6, 4))
+        self.canvas.create_text(lx + 35, ly + 73, text="Comparison",
+                                anchor='w', font=('Arial', 8), fill='#ff6bff')
+
+    def on_resize(self, event):
+        try:
+            self.show_values()
+        except Exception:
+            pass
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MollierApp(root)
+    root.bind('<Configure>', app.on_resize)
+    root.mainloop()
